@@ -17,7 +17,8 @@ from db_helper import DatabaseHelper
 import socket
 import threading
 from queue import Queue
-
+import ctypes
+from ctypes import *
 
 
 def letterbox_resize(image, size, bg_color):
@@ -300,7 +301,41 @@ class FaceEnrollmentProcessor:
         """Stop the processing thread"""
         self.is_running = False
 
+def ps3camLoad():
+    # Load library
+    try:
+        lib = ctypes.CDLL('/usr/local/lib/libps3eye_wrapper.so')
+    except Exception as e:
+        print(f"❌ Failed to load library: {e}")
+        print("Run: ./use_cpp_wrapper_fixed.sh")
+        sys.exit(1)
 
+    # Define function signatures
+    lib.ps3eye_init.restype = c_int
+    lib.ps3eye_start.argtypes = [c_int, c_int, c_int]
+    lib.ps3eye_start.restype = c_int
+    lib.ps3eye_get_frame.argtypes = [POINTER(c_ubyte)]
+    lib.ps3eye_get_frame.restype = c_int
+    lib.ps3eye_stop.restype = None
+    lib.ps3eye_set_gain.argtypes = [c_int]
+    lib.ps3eye_set_exposure.argtypes = [c_int]
+    lib.ps3eye_set_autogain.argtypes = [c_int]
+
+    # Initialize
+    print("Initializing camera...")
+    if lib.ps3eye_init() == 0:
+        print("❌ No camera found!")
+        sys.exit(1)
+    print("✓ Camera detected")
+
+    # Start camera
+    width, height, fps = 640, 480, 30
+    if lib.ps3eye_start(width, height, fps) == 0:
+        print("❌ Failed to start camera!")
+        sys.exit(1)
+    lib.ps3eye_set_exposure(200)
+
+    return lib 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RetinaFace Python Demo', add_help=True)
@@ -547,23 +582,27 @@ if __name__ == '__main__':
 
     # ADD THIS: Set up USB camera for locker assignment
     print("📷 Initializing USB camera...")
-    usb_cam = cv2.VideoCapture(0)  # 0 is usually the first USB camera
-    if not usb_cam.isOpened():
-        print("⚠️  USB camera not found, trying camera 1...")
-        usb_cam = cv2.VideoCapture(1)
-        if not usb_cam.isOpened():
-            print("❌ USB camera failed to open!")
-            usb_cam = None
-        else:
-            print("✅ USB camera opened on index 1")
-    else:
-        print("✅ USB camera opened on index 0")
+        buffer_size = 640 * 480 * 3
+    buffer = (c_ubyte * buffer_size)()
+
+    ps3Cap = ps3camLoad()
+    # usb_cam = cv2.VideoCapture(0)  # 0 is usually the first USB camera
+    # if not usb_cam.isOpened():
+    #     print("⚠️  USB camera not found, trying camera 1...")
+    #     usb_cam = cv2.VideoCapture(1)
+    #     if not usb_cam.isOpened():
+    #         print("❌ USB camera failed to open!")
+    #         usb_cam = None
+    #     else:
+    #         print("✅ USB camera opened on index 1")
+    # else:
+    #     print("✅ USB camera opened on index 0")
 
     # Set USB camera properties
-    if usb_cam:
-        usb_cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        usb_cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        usb_cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # if usb_cam:
+    #     usb_cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    #     usb_cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    #     usb_cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
     # cap.set(cv2.CAP_PROP_FPS,10)
     img_width = 640 # int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -732,7 +771,16 @@ if __name__ == '__main__':
                 print("Too many retries, resetting camera/system...")
                 # here you can reset camera service, or reboot camera if possible
             continue
+        
+        if ps3Cap.ps3eye_get_frame(buffer) == 0:
+            print("Failed to get frame")
+            break
+        
+        # Convert to numpy array
+        frame = np.frombuffer(buffer, dtype=np.uint8)
+        frame = frame.reshape((480, 640, 3))
 
+        usb_img = process_usb_camera_frame(frame)
         retry_count = 0  # reset retries after success
   
         letterbox_img, aspect_ratio, offset_x, offset_y = letterbox_resize(img, (model_height,model_width), 114)  # letterbox缩放
@@ -876,8 +924,10 @@ if __name__ == '__main__':
         # img_path = './result.jpg'
         tm.stop()
         print('FPS! ',tm.getFPS())
-        cv2.namedWindow("SFace Demo", cv2.WINDOW_FULLSCREEN)
-        cv2.imshow("SFace Demo", img)
+        cv2.namedWindow("STREAM CAM", cv2.WINDOW_FULLSCREEN)
+        cv2.imshow("STREAM CAM", img)
+        cv2.namedWindow("USB CAM", cv2.WINDOW_FULLSCREEN)
+        cv2.imshow("USB CAM", usb_img)
         tm.reset()
         
     # cv2.imwrite(img_path, img)
