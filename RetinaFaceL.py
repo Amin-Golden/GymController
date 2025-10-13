@@ -1,3 +1,4 @@
+# python RetinaFaceL.py --model_path ../model/retinaface.rknn 
 import os
 import sys
 import urllib
@@ -202,102 +203,94 @@ class FaceEnrollmentProcessor:
             
             # Process image for face detection
             model_height, model_width = (320, 320)
-            letterbox_img, aspect_ratio, offset_x, offset_y = letterbox_resize(
-                img, (model_height, model_width), 114
-            )
+            letterbox_img, aspect_ratio, offset_x, offset_y = letterbox_resize(img, (model_height, model_width), 114)
             infer_img = np.expand_dims(letterbox_img, 0)
             
             # Detect face (you need to pass rknn for detection)
             # For now, we'll assume the image contains a face and process the whole face
             # You may want to add face detection here using your RetinaFace model
             
-        # Inference
-        outputs = rknn.inference(inputs=[infer_img])
-        loc, conf, landmarks = outputs
-        priors = PriorBox(image_size=(model_height, model_width))
-        boxes = box_decode(loc.squeeze(0), priors)
-        scale = np.array([model_width, model_height,
-                        model_width, model_height])
-        boxes = boxes * scale // 1  # face box
-        boxes[...,0::2] =np.clip((boxes[...,0::2] - offset_x) / aspect_ratio, 0, img_width)  #letterbox
-        boxes[...,1::2] =np.clip((boxes[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
-        scores = conf.squeeze(0)[:, 1]  # face score
-        landmarks = decode_landm(landmarks.squeeze(
-            0), priors)  # face keypoint data
-        scale_landmarks = np.array([model_width, model_height, model_width, model_height,
-                                    model_width, model_height, model_width, model_height,
-                                    model_width, model_height])
-        landmarks = landmarks * scale_landmarks // 1
-        landmarks[...,0::2] = np.clip((landmarks[...,0::2] - offset_x) / aspect_ratio, 0, img_width) #letterbox
-        landmarks[...,1::2] = np.clip((landmarks[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
-        # ignore low scores
-        inds = np.where(scores > 0.1)[0]
-        boxes = boxes[inds]
-        landmarks = landmarks[inds]
-        scores = scores[inds]
+            # Inference
+            outputs = rknn.inference(inputs=[infer_img])
+            loc, conf, landmarks = outputs
+            priors = PriorBox(image_size=(model_height, model_width))
+            boxes = box_decode(loc.squeeze(0), priors)
+            scale = np.array([model_width, model_height,model_width, model_height])
+            boxes = boxes * scale // 1  # face box
+            boxes[...,0::2] =np.clip((boxes[...,0::2] - offset_x) / aspect_ratio, 0, img_width)  #letterbox
+            boxes[...,1::2] =np.clip((boxes[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
+            scores = conf.squeeze(0)[:, 1]  # face score
+            landmarks = decode_landm(landmarks.squeeze(0), priors)  # face keypoint data
+            scale_landmarks = np.array([model_width, model_height, model_width, model_height,
+                                        model_width, model_height, model_width, model_height,
+                                        model_width, model_height])
+            landmarks = landmarks * scale_landmarks // 1
+            landmarks[...,0::2] = np.clip((landmarks[...,0::2] - offset_x) / aspect_ratio, 0, img_width) #letterbox
+            landmarks[...,1::2] = np.clip((landmarks[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
+            # ignore low scores
+            inds = np.where(scores > 0.1)[0]
+            boxes = boxes[inds]
+            landmarks = landmarks[inds]
+            scores = scores[inds]
 
-        order = scores.argsort()[::-1]
-        boxes = boxes[order]
-        landmarks = landmarks[order]
-        scores = scores[order]
+            order = scores.argsort()[::-1]
+            boxes = boxes[order]
+            landmarks = landmarks[order]
+            scores = scores[order]
 
-        # NMS
-        dets = np.hstack((boxes, scores[:, np.newaxis])).astype(
-            np.float32, copy=False)
-        keep = nms(dets, 0.5)
-        dets = dets[keep, :]
-        landmarks = landmarks[keep]
-        dets = np.concatenate((dets, landmarks), axis=1)
+            # NMS
+            dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
+            keep = nms(dets, 0.5)
+            dets = dets[keep, :]
+            landmarks = landmarks[keep]
+            dets = np.concatenate((dets, landmarks), axis=1)
 
-        for data in dets:
-            if data[4] < 0.7:
-                continue
-            # print("face @ (%d %d %d %d) %f"%(data[0], data[1], data[2], data[3], data[4]))
-            text = "{:.4f}".format(data[4])
-            data = list(map(int, data))
-            dx =  data[7] - data[5]
-            dy = data[8] - data[6]
-            angle = math.atan2(dy, dx) * 180. / math.pi  # Convert radians to degrees
+            for data in dets:
+                if data[4] < 0.7:
+                    continue
+                # print("face @ (%d %d %d %d) %f"%(data[0], data[1], data[2], data[3], data[4]))
+                text = "{:.4f}".format(data[4])
+                data = list(map(int, data))
+                dx =  data[7] - data[5]
+                dy = data[8] - data[6]
+                angle = math.atan2(dy, dx) * 180. / math.pi  # Convert radians to degrees
 
-            # Calculate the center point between the eyes, which will be the rotation center
-            eye_center = (
-                (data[5] + data[7]) // 2,
-                (data[6] + data[8]) // 2
-            )
+                # Calculate the center point between the eyes, which will be the rotation center
+                eye_center = ((data[5] + data[7]) // 2,(data[6] + data[8]) // 2)
 
-            # Get the rotation matrix for the calculated angle and center
-            # We use a scale of 1.0 to ensure the face size remains the same.
-            rotation_matrix = cv2.getRotationMatrix2D(eye_center, angle, scale=1.0)
+                # Get the rotation matrix for the calculated angle and center
+                # We use a scale of 1.0 to ensure the face size remains the same.
+                rotation_matrix = cv2.getRotationMatrix2D(eye_center, angle, scale=1.0)
 
-            # Get the dimensions of the image
-            (h, w) = img.shape[:2]
+                # Get the dimensions of the image
+                (h, w) = img.shape[:2]
 
-            # Apply the affine transformation (rotation) to the image
-            aligned_img = cv2.warpAffine(img, rotation_matrix, (w, h))
+                # Apply the affine transformation (rotation) to the image
+                aligned_img = cv2.warpAffine(img, rotation_matrix, (w, h))
 
-            face_img = aligned_img[(data[1]): (data[3]), (data[0]):(data[2])]
-            letterbox_face, Faspect_ratio, Foffset_x, Foffset_y = letterbox_resize(face_img, (Face_model_height,Face_model_width), 114)  # letterbox缩放
-            # infer_img = letterbox_img[..., ::-1]  # BGR2RGB
-            # cv2.namedWindow("Face", cv2.WINDOW_AUTOSIZE)
-            # cv2.imshow("Face", letterbox_face)
-            Finfer_img = np.expand_dims(letterbox_face, 0)
-            outputs = rknnFace.inference(inputs=[Finfer_img])
-        
-            if len(outputs) > 0:
-                embedding = outputs[0][0].astype(np.float32)
-                
-                # Save to database
-                success = self.db.save_face_embedding(client_id, embedding, confidence=1.0)
-                
-                if success:
-                    client_info = self.db.get_client_info(client_id)
-                    name = f"{client_info['first_name']} {client_info['last_name']}" if client_info else "Unknown"
-                    print(f"✅ Successfully enrolled: {name} (ID: {client_id})")
+                face_img = aligned_img[(data[1]): (data[3]), (data[0]):(data[2])]
+                letterbox_face, Faspect_ratio, Foffset_x, Foffset_y = letterbox_resize(face_img, (Face_model_height,Face_model_width), 114)  # letterbox缩放
+                # infer_img = letterbox_img[..., ::-1]  # BGR2RGB
+                # cv2.namedWindow("Face", cv2.WINDOW_AUTOSIZE)
+                # cv2.imshow("Face", letterbox_face)
+                Finfer_img = np.expand_dims(letterbox_face, 0)
+                outputs = rknnFace.inference(inputs=[Finfer_img])
+            
+                if len(outputs) > 0:
+                    embedding = outputs[0][0].astype(np.float32)
+                    
+                    # Save to database
+                    success = self.db.save_face_embedding(client_id, embedding, confidence=1.0)
+                    
+                    if success:
+                        client_info = self.db.get_client_info(client_id)
+                        name = f"{client_info['first_name']} {client_info['last_name']}" if client_info else "Unknown"
+                        print(f"✅ Successfully enrolled: {name} (ID: {client_id})")
+                    else:
+                        print(f"❌ Failed to save embedding for client {client_id}")
                 else:
-                    print(f"❌ Failed to save embedding for client {client_id}")
-            else:
-                print(f"❌ No face embedding extracted for client {client_id}")
-                
+                    print(f"❌ No face embedding extracted for client {client_id}")
+                    
         except Exception as e:
             print(f"❌ Error processing client {client_id}: {e}")
             import traceback
@@ -324,7 +317,7 @@ if __name__ == '__main__':
 
         # Initialize database connection
     print("🔌 Connecting to database...")
-   db = DatabaseHelper(
+    db = DatabaseHelper(
         host=args.db_host,  # Your Windows PC IP
         database='gym-db',
         user='postgres',
@@ -338,7 +331,8 @@ if __name__ == '__main__':
     esp32_1_port = 4210
     esp32_2_ip = "192.168.1.202"
     esp32_2_port = 4210
-
+    raspi_ip = "192.168.1.210"
+    raspi_port = 4210
  
     # Load all registered face embeddings from database
     # embedding_shape = (512,)  # ArcFace embedding size
@@ -523,12 +517,31 @@ if __name__ == '__main__':
     deviceId = 8
     camstp = "rtsp://10.183.120.18:554/"
     camrstp = "rtsp:/10.183.120.18:8554/live"
+    camrstp = "rtsp://192.168.100.82:8554/live"
+
     def open_stream():
-        cap = cv2.VideoCapture(camrstp)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)  # reduce buffering
-        # cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
-        # cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
-        return cap
+        # GStreamer pipeline for low-latency RTSP streaming
+        # gst_pipeline = (
+        # f"rtspsrc location={camrstp} latency=0 ! "
+        # "rtph264depay ! h264parse ! mppvideodec ! "
+        # "videoconvert ! appsink")
+
+        gst_pipeline = (
+        f"rtspsrc location={camrstp} latency=0 ! "
+        "rtph264depay ! h264parse ! mppvideodec ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink max-buffers=1 drop=true"
+        )
+        cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            print("✅ SUCCESS! Pipeline 1 works!")
+            return cap
+        else:
+            print("❌ Failed")
+        #     cap = cv2.VideoCapture(camrstp)
+        #     cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
+        #   return cap
+            return None
     cap = open_stream()
     retry_count = 0
 
@@ -821,6 +834,7 @@ if __name__ == '__main__':
                     client_info = db.get_client_by_id(client_id)
                     if client_info and client_info['locker'] is not None:
                         locker_number = client_info['locker']
+                        sock.sendto(str(locker_number).encode("utf-8"), (raspi_ip, raspi_port))
                         if locker_number > 0 and locker_number < 23 :
                             sock.sendto(str(locker_number).encode("utf-8"), (esp32_1_ip, esp32_1_port))
                         elif locker_number > 22 and locker_number < 61 :
