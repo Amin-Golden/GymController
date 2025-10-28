@@ -1265,3 +1265,46 @@ class DatabaseHelper:
     #      if connection is None:
     #          print("Failed to get database connection!")
     #          return None  # or handle appropriately
+
+
+    def get_multiple_client_infos(self, client_ids):
+        """Get multiple client infos in one query"""
+        connection = None
+        try:
+            connection = self.get_connection_with_timeout(timeout=2.0)
+            if connection is None:
+                return {}
+            
+            cursor = connection.cursor()
+            
+            # Use IN clause for batch query
+            query = """
+                SELECT id, fname, lname, email, phone_number, locker, image_path
+                FROM clients WHERE id = ANY(%s)
+            """
+            cursor.execute(query, (client_ids,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            
+            # Build dictionary
+            infos = {}
+            for row in results:
+                infos[row[0]] = {
+                    'id': row[0],
+                    'fname': row[1],
+                    'lname': row[2],
+                    'email': row[3],
+                    'phone_number': row[4],
+                    'locker': row[5],
+                    'image_path': self.convert_image_path(row[6]) if row[6] else None
+                }
+            
+            return infos
+            
+        except Exception as e:
+            print(f"❌ Error getting multiple client infos: {e}")
+            return {}
+        finally:
+            if connection:
+                self.return_connection(connection)

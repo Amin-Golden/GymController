@@ -20,7 +20,76 @@ from queue import Queue
 import ctypes
 from ctypes import *
 import traceback
+from functools import lru_cache
+
 HEADLESS = os.environ.get('DISPLAY') is None
+
+def check_db_pool_health():
+    """Monitor database connection pool status"""
+    try:
+        # Get pool statistics
+        pool = db.connection_pool._pool
+        available = len([c for c in pool if c])
+        in_use = len(pool) - available
+        
+        if in_use > 40:  # 80% capacity
+            print(f"⚠️ Database pool high: {in_use}/50 connections in use")
+        
+        if in_use >= 48:  # 96% capacity
+            print(f"🚨 DATABASE POOL CRITICAL: {in_use}/50 connections!")
+            # Force connection cleanup
+            db.connection_pool.closeall()
+            # Recreate pool
+            db.__init__(db.host, db.database, db.user, db.password, db.port)
+    except Exception as e:
+        print(f"Error checking pool: {e}")
+
+# Add caching with expiration
+class TimedCache:
+    def __init__(self, max_age=30):
+        self.cache = {}
+        self.timestamps = {}
+        self.max_age = max_age
+        self.lock = threading.Lock()
+    
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                age = time.time() - self.timestamps[key]
+                if age < self.max_age:
+                    return self.cache[key]
+                else:
+                    # Expired, remove
+                    del self.cache[key]
+                    del self.timestamps[key]
+            return None
+    
+    def set(self, key, value):
+        with self.lock:
+            self.cache[key] = value
+            self.timestamps[key] = time.time()
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.timestamps.clear()
+
+# Create caches
+client_info_cache = TimedCache(max_age=30)  # Cache for 30 seconds
+membership_cache = TimedCache(max_age=30)
+
+# Cached wrapper for get_client_info
+def get_client_info_cached(client_id):
+    """Get client info with caching to reduce database load"""
+    cached = client_info_cache.get(client_id)
+    if cached is not None:
+        return cached
+    
+    # Not in cache, query database
+    info = db.get_client_info(client_id)
+    if info:
+        client_info_cache.set(client_id, info)
+    return info
 
 def letterbox_resize(image, size, bg_color):
     """
@@ -282,7 +351,7 @@ class FaceEnrollmentProcessor:
             if not os.path.exists(image_path):
                 print(f"⚠️  Image not found: {image_path}")
                 # Try to get client info and convert path again
-                client_info = self.db.get_client_info(client_id)
+                client_info = self.get_client_info_cached(client_id)
                 if client_info and client_info.get('image_path'):
                     image_path = client_info['image_path']
                     # print(f"🔄 Retrying with converted path: {image_path}")
@@ -344,7 +413,7 @@ class FaceEnrollmentProcessor:
             dets = dets[keep, :]
             landmarks = landmarks[keep]
             dets = np.concatenate((dets, landmarks), axis=1)
-
+            detected_client_ids = []
             for data in dets:
                 if data[4] < 0.9:
                     continue
@@ -386,7 +455,7 @@ class FaceEnrollmentProcessor:
                     success = self.db.save_face_embedding(client_id, embedding, confidence=1.0)
                     
                     if success:
-                        client_info = self.db.get_client_info(client_id)
+                        client_info = self.get_client_info_cached(client_id)
                         name = f"{client_info['fname']} {client_info['lname']}" if client_info else "Unknown"
                         print(f"✅ Successfully enrolled: {name} (ID: {client_id})")
                         reload_embeddings()
@@ -600,7 +669,7 @@ if __name__ == '__main__':
             # print(f"   Valid until: {membership['end_date']}")
             
             # 2. Get client info to check current locker status
-            client_info = db.get_client_info(client_id)
+            client_info = get_client_info_cached(client_id)
             
             if not client_info:
                 print(f"❌ Client info not found for {client_name}")
@@ -851,7 +920,7 @@ if __name__ == '__main__':
             dets = dets[keep, :]
             landmarks = landmarks[keep]
             dets = np.concatenate((dets, landmarks), axis=1)
-
+            detected_client_ids = []
             for data in dets:
                 try:    
                     if data[4] < 0.85:
@@ -899,7 +968,7 @@ if __name__ == '__main__':
                                 client_name = best_match['name']
                                 
                                 # Check current locker status
-                                client_info = db.get_client_info(client_id)
+                                client_info = get_client_info_cached(client_id)
                                 if client_info:
                                     if client_info['locker'] is None:
                                         status = "ENTRY"
@@ -953,11 +1022,13 @@ if __name__ == '__main__':
             # Locker unlock cooldown tracking (ADD THIS BEFORE WHILE LOOP)
         last_locker_unlock = {}  # Track last unlock time per locker
         locker_unlock_cooldown = 10  # seconds between unlocks for same locker
-        
+        frame_count = 0
         while cv2.waitKey(1) < 0:
             try:
+                frame_count += 1
                 tm.start()
-
+                if frame_count % 300 == 0:  # Every 10 seconds
+                    check_db_pool_health()
                 # Periodically reload embeddings
                 if time.time() - last_reload_time > reload_interval:
                     reload_embeddings()
@@ -1076,7 +1147,7 @@ if __name__ == '__main__':
                 dets = dets[keep, :]
                 landmarks = landmarks[keep]
                 dets = np.concatenate((dets, landmarks), axis=1)
-
+                detected_client_ids = []
                 for data in dets:
                     try:
                         if data[4] < 0.85:
@@ -1136,7 +1207,7 @@ if __name__ == '__main__':
                                     print(f"Access GRANTED: {client_name} (ID: {client_id}), Confidence: {best_similarity:.2f}")
                                     
                                     # Get locker number
-                                    client_info = db.get_client_info(client_id)
+                                    client_info = get_client_info_cached(client_id)
                                     
                                     if client_info and client_info['locker'] is not None:
                                         locker_number = client_info['locker'] + 1
