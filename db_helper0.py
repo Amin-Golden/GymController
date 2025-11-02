@@ -8,8 +8,6 @@ from datetime import datetime
 import threading
 import time
 import os
-import pickle
-import cv2
 
 class DatabaseHelper:
     def __init__(self, host, database, user, password, port=5432, mount_point="/mnt/winshare"):
@@ -129,7 +127,7 @@ class DatabaseHelper:
         """Save face embedding for a client"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             confidence = self.convert_numpy_types(confidence)
 
@@ -172,7 +170,7 @@ class DatabaseHelper:
         """Retrieve face embedding for a specific client"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = "SELECT embedding FROM face_embeddings WHERE client_id = %s"
@@ -198,7 +196,7 @@ class DatabaseHelper:
         """Retrieve all face embeddings with client IDs"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
@@ -232,15 +230,15 @@ class DatabaseHelper:
                 self.return_connection(connection)
 
     def get_client_info(self, client_id):
-        """Get client information including locker status"""
+        """Get client information including image path"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
-                SELECT id, fname, lname, email, phone_number,
-                       locker, image_data IS NOT NULL AS has_image
+                SELECT id, fname, lname, email, phone_number, 
+                       locker , image_path
                 FROM clients WHERE id = %s
             """
             cursor.execute(query, (client_id,))
@@ -249,6 +247,14 @@ class DatabaseHelper:
             cursor.close()
             
             if result:
+                windows_path = result[6] if len(result) > 6 else None
+                # linux_path = self.convert_image_path(windows_path)
+                try:
+                    linux_path = self.convert_image_path(windows_path) if windows_path else None
+                except Exception as path_error:
+                    print(f"⚠️  Path conversion failed for client {client_id}: {path_error}")
+                    linux_path = None
+            
                 return {
                     'id': result[0],
                     'fname': result[1],
@@ -256,7 +262,8 @@ class DatabaseHelper:
                     'email': result[3],
                     'phone_number': result[4],
                     'locker': result[5],
-                    'has_image': result[6]
+                    'image_path': linux_path,  # Converted path
+                    'image_path_original': windows_path  # Keep original
                 }
             return None
             
@@ -271,7 +278,7 @@ class DatabaseHelper:
         """Check if face embedding exists for a client"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = "SELECT COUNT(*) FROM face_embeddings WHERE client_id = %s"
@@ -321,7 +328,7 @@ class DatabaseHelper:
         """Get all clients that need face embedding enrollment"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
@@ -396,7 +403,7 @@ class DatabaseHelper:
         """Log gym access attempts"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             confidence = self.convert_numpy_types(confidence)
 
@@ -432,7 +439,7 @@ class DatabaseHelper:
         """Find the first available locker number"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             # Get all assigned lockers
@@ -476,7 +483,7 @@ class DatabaseHelper:
             client_id = int(client_id)
             locker_number = int(locker_number)
             
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             print(f"🔍 Assigning locker {locker_number} to client {client_id}...")
             cursor.execute("SELECT id, fname, lname FROM clients WHERE id = %s", (client_id,))
@@ -547,7 +554,7 @@ class DatabaseHelper:
         """Get detailed membership summary for display"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
@@ -558,7 +565,7 @@ class DatabaseHelper:
                     m.status,
                     m.start_date,
                     m.end_date,
-                    p.package_name,
+                    P.package_name,
                     m.is_paid
                 FROM clients c
                 LEFT JOIN memberships m ON c.id = m.client_id  
@@ -600,7 +607,7 @@ class DatabaseHelper:
         """
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             # First check current sessions
@@ -676,7 +683,7 @@ class DatabaseHelper:
         """
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
@@ -737,7 +744,7 @@ class DatabaseHelper:
         """Check if client has an active, paid membership"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
@@ -780,7 +787,7 @@ class DatabaseHelper:
         """Record gym entrance time and locker assignment"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             # Check if there's an open session (no exit_time)
@@ -829,7 +836,7 @@ class DatabaseHelper:
         """Record gym exit time"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             # Find the open session
@@ -876,7 +883,7 @@ class DatabaseHelper:
             
             client_id = int(client_id)
 
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             print(f"🔍 Unassigning locker for client {client_id}...")
             # First, check if client exists and has a locker assigned
@@ -948,7 +955,7 @@ class DatabaseHelper:
         """Get current open gym session for a client"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
@@ -981,7 +988,7 @@ class DatabaseHelper:
         """Diagnose database state - useful for debugging"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             print("\n" + "="*60)
@@ -1043,7 +1050,7 @@ class DatabaseHelper:
         """Get all gym sessions for today"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = """
@@ -1087,7 +1094,7 @@ class DatabaseHelper:
         """Delete face embedding for a client"""
         connection = None
         try:
-            connection = self.get_connection_with_timeout()
+            connection = self.get_connection()
             cursor = connection.cursor()
             
             query = "DELETE FROM face_embeddings WHERE client_id = %s"
@@ -1112,20 +1119,34 @@ class DatabaseHelper:
         """Regenerate face embedding for a client after image update"""
         print(f"🔄 Regenerating face embedding for client {client_id}...")
         
-        # Ensure client exists
+        # Get client info
         client_info = self.get_client_info(client_id)
         if not client_info:
             print(f"❌ Client {client_id} not found")
             return False
         
-        img = self.get_client_image(client_id)
-        if img is None:
-            print(f"⚠️  No image data for client {client_id}")
+        image_path = client_info.get('image_path')
+        if not image_path:
+            print(f"⚠️  No image path for client {client_id}")
+            return False
+        
+        if not os.path.exists(image_path):
+            print(f"❌ Image file not found: {image_path}")
             return False
         
         try:
+            # Import required libraries (assuming you have face recognition code)
+            import cv2
+            
+            # Read image
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"❌ Failed to read image: {image_path}")
+                return False
+            
             # Generate embedding using your face recognition model
-            embedding = face_recognition_model.generate_embedding(img)
+            # This is a placeholder - replace with your actual face recognition code
+            embedding = face_recognition_model.generate_embedding(image)
             
             if embedding is None:
                 print(f"❌ Failed to generate embedding for client {client_id}")
@@ -1162,8 +1183,8 @@ class DatabaseHelper:
             
             if action == 'INSERT':
                 # New client - generate embedding
-                image_data = payload.get('image_data')
-                if image_data:
+                image_path = payload.get('image_path')
+                if image_path:
                     print(f"🆕 New client {client_id} - will generate embedding")
                     self.regenerate_face_embedding(client_id, face_recognition_model)
             
@@ -1210,344 +1231,3 @@ class DatabaseHelper:
             return bool(value)
         else:
             return value
-        
-    def get_connection_with_timeout(self, timeout=1.0):
-        """Get connection with timeout to prevent infinite blocking"""
-        import threading
-        
-        result = [None]
-        exception = [None]
-        
-        def get_conn():
-            try:
-                result[0] = self.connection_pool.getconn()
-            except Exception as e:
-                exception[0] = e
-        
-        thread = threading.Thread(target=get_conn)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout)
-        
-        if thread.is_alive():
-            print(f"⚠️ Connection pool timeout after {timeout}s!")
-            return None
-        
-        if exception[0]:
-            raise exception[0]
-        
-        return result[0]
-
-    # Then update all get_connection() calls:
-    # OLD: connection = self.get_connection()
-    # NEW: connection = self.get_connection_with_timeout(timeout=2.0)
-    #      if connection is None:
-    #          print("Failed to get database connection!")
-    #          return None  # or handle appropriately
-
-
-    def get_multiple_client_infos(self, client_ids):
-        """Get multiple client infos in one query"""
-        connection = None
-        try:
-            connection = self.get_connection_with_timeout(timeout=2.0)
-            if connection is None:
-                return {}
-            
-            cursor = connection.cursor()
-            
-            query = """
-                SELECT id, fname, lname, email, phone_number,
-                       locker, image_data IS NOT NULL AS has_image
-                FROM clients WHERE id = ANY(%s)
-            """
-            cursor.execute(query, (client_ids,))
-            
-            results = cursor.fetchall()
-            cursor.close()
-            
-            infos = {}
-            for row in results:
-                infos[row[0]] = {
-                    'id': row[0],
-                    'fname': row[1],
-                    'lname': row[2],
-                    'email': row[3],
-                    'phone_number': row[4],
-                    'locker': row[5],
-                    'has_image': row[6]
-                }
-            
-            return infos
-            
-        except Exception as e:
-            print(f"❌ Error getting multiple client infos: {e}")
-            return {}
-        finally:
-            if connection:
-                self.return_connection(connection)
-
-    def get_client_image(self, client_id):
-        """Retrieve client image as OpenCV image from database"""
-        connection = None
-        try:
-            connection = self.get_connection_with_timeout(timeout=3.0)
-            if connection is None:
-                return None
-            cursor = connection.cursor()
-            cursor.execute("SELECT image_data FROM clients WHERE id = %s", (client_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            if result and result[0]:
-                image_data = result[0]
-                nparr = np.frombuffer(image_data, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if img is None:
-                    print(f"⚠️  Failed to decode image data for client {client_id}")
-                return img
-            return None
-        except Exception as e:
-            print(f"❌ Error retrieving client image: {e}")
-            return None
-        finally:
-            if connection:
-                self.return_connection(connection)
-
-    # ========================================
-    # FINGERPRINT METHODS
-    # ========================================
-
-    def save_fingerprint_features(self, client_id, features_list):
-        """
-        Save 5 fingerprint feature samples for a client
-        
-        Args:
-            client_id: Client ID
-            features_list: List of 5 feature dictionaries with keys:
-                          'descriptors', 'keypoints', 'num_features', 'confidence'
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        connection = None
-        try:
-            if not features_list or len(features_list) == 0:
-                print(f"❌ No features provided for client {client_id}")
-                return False
-            
-            connection = self.get_connection_with_timeout(timeout=5.0)
-            if connection is None:
-                return False
-            
-            cursor = connection.cursor()
-            
-            # Delete existing fingerprints for this client
-            cursor.execute("DELETE FROM fingerprint_features WHERE client_id = %s", (client_id,))
-            
-            # Insert each sample
-            for idx, features in enumerate(features_list, start=1):
-                if features is None:
-                    continue
-                
-                descriptors = features.get('descriptors')
-                keypoints = features.get('keypoints', [])
-                num_features = len(descriptors) if descriptors is not None else 0
-                confidence = features.get('confidence', 1.0)
-                
-                if descriptors is None or num_features == 0:
-                    print(f"⚠️  Skipping sample {idx} - no descriptors")
-                    continue
-                
-                # Convert to binary
-                descriptors_binary = descriptors.tobytes()
-                keypoints_binary = pickle.dumps(keypoints)
-                
-                query = """
-                    INSERT INTO fingerprint_features 
-                    (client_id, sample_number, descriptors, keypoints_data, num_features, confidence, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """
-                
-                cursor.execute(query, (
-                    client_id,
-                    idx,
-                    psycopg2.Binary(descriptors_binary),
-                    psycopg2.Binary(keypoints_binary),
-                    num_features,
-                    self.convert_numpy_types(confidence),
-                    datetime.now()
-                ))
-                
-                print(f"✅ Saved fingerprint sample {idx} for client {client_id} ({num_features} features)")
-            
-            connection.commit()
-            cursor.close()
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error saving fingerprint features: {e}")
-            import traceback
-            traceback.print_exc()
-            if connection:
-                connection.rollback()
-            return False
-        finally:
-            if connection:
-                self.return_connection(connection)
-
-    def get_fingerprint_features(self, client_id):
-        """
-        Retrieve all fingerprint features for a client
-        
-        Returns:
-            List of feature dictionaries or empty list if not found
-        """
-        connection = None
-        try:
-            connection = self.get_connection_with_timeout(timeout=3.0)
-            if connection is None:
-                return []
-            
-            cursor = connection.cursor()
-            
-            query = """
-                SELECT sample_number, descriptors, keypoints_data, num_features, confidence
-                FROM fingerprint_features
-                WHERE client_id = %s
-                ORDER BY sample_number
-            """
-            cursor.execute(query, (client_id,))
-            
-            results = cursor.fetchall()
-            cursor.close()
-            
-            features_list = []
-            for row in results:
-                sample_num, desc_binary, kp_binary, num_feat, conf = row
-                
-                # Convert from binary
-                descriptors = np.frombuffer(desc_binary, dtype=np.float32)
-                
-                # Reshape based on descriptor type (SIFT=128D, ORB=32bytes=256bits)
-                if len(descriptors) % 128 == 0:
-                    descriptors = descriptors.reshape(-1, 128)
-                else:
-                    descriptors = descriptors.reshape(-1, 32)
-                
-                keypoints = pickle.loads(kp_binary) if kp_binary else []
-                
-                features_list.append({
-                    'sample_number': sample_num,
-                    'descriptors': descriptors,
-                    'keypoints': keypoints,
-                    'num_features': num_feat,
-                    'confidence': conf
-                })
-            
-            return features_list
-            
-        except Exception as e:
-            print(f"❌ Error retrieving fingerprint features: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-        finally:
-            if connection:
-                self.return_connection(connection)
-
-    def get_all_fingerprint_features(self):
-        """
-        Retrieve all fingerprint features from database with client info
-        
-        Returns:
-            List of dicts with client_id, name, and features
-        """
-        connection = None
-        try:
-            connection = self.get_connection_with_timeout(timeout=5.0)
-            if connection is None:
-                return []
-            
-            cursor = connection.cursor()
-            
-            query = """
-                SELECT DISTINCT ff.client_id, c.fname, c.lname
-                FROM fingerprint_features ff
-                JOIN clients c ON ff.client_id = c.id
-                ORDER BY ff.client_id
-            """
-            cursor.execute(query)
-            
-            clients = cursor.fetchall()
-            cursor.close()
-            
-            result = []
-            for client_id, fname, lname in clients:
-                features_list = self.get_fingerprint_features(client_id)
-                if features_list:
-                    result.append({
-                        'client_id': client_id,
-                        'name': f"{fname} {lname}",
-                        'fingerprints': features_list
-                    })
-            
-            return result
-            
-        except Exception as e:
-            print(f"❌ Error retrieving all fingerprint features: {e}")
-            return []
-        finally:
-            if connection:
-                self.return_connection(connection)
-
-    def check_fingerprint_exists(self, client_id):
-        """Check if fingerprint features exist for a client"""
-        connection = None
-        try:
-            connection = self.get_connection_with_timeout(timeout=2.0)
-            if connection is None:
-                return False
-            
-            cursor = connection.cursor()
-            
-            query = "SELECT COUNT(*) FROM fingerprint_features WHERE client_id = %s"
-            cursor.execute(query, (client_id,))
-            
-            result = cursor.fetchone()
-            cursor.close()
-            
-            return result[0] > 0
-            
-        except Exception as e:
-            print(f"❌ Error checking fingerprint: {e}")
-            return False
-        finally:
-            if connection:
-                self.return_connection(connection)
-
-    def delete_fingerprint_features(self, client_id):
-        """Delete all fingerprint features for a client"""
-        connection = None
-        try:
-            connection = self.get_connection_with_timeout(timeout=3.0)
-            if connection is None:
-                return False
-            
-            cursor = connection.cursor()
-            
-            query = "DELETE FROM fingerprint_features WHERE client_id = %s"
-            cursor.execute(query, (client_id,))
-            
-            connection.commit()
-            cursor.close()
-            print(f"✅ Fingerprint features deleted for client_id: {client_id}")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error deleting fingerprint features: {e}")
-            if connection:
-                connection.rollback()
-            return False
-        finally:
-            if connection:
-                self.return_connection(connection)

@@ -1,7 +1,13 @@
--- ========================================
--- # Save the script to a file
--- # Then run:
+-- Option 1: Using pgAdmin
+
+-- Open pgAdmin
+-- Connect to your database
+-- Right-click on your database → Query Tool
+-- Paste the entire script above
+-- Click Execute (F5)
 -- psql -U postgres -d gym_db -f database_setup.sql
+
+-- ========================================
 -- 1. CREATE GYM SESSIONS TABLE
 -- ========================================
 -- This table tracks entrance and exit times for gym visits
@@ -93,7 +99,7 @@ BEGIN
     END IF;
 END $$;
 
--- Add index on locker for faster queries
+-- Add index on locker for faster queries 
 CREATE INDEX IF NOT EXISTS idx_clients_locker ON public.clients(locker) WHERE locker IS NOT NULL;
 
 
@@ -110,8 +116,8 @@ BEGIN
             'action', 'INSERT',
             'client_id', NEW.id,
             'image_path', NEW.image_path,
-            'first_name', NEW.fname,
-            'last_name', NEW.lname
+            'fname', NEW.fname,
+            'lname', NEW.lname
         )::text);
         RETURN NEW;
     ELSIF (TG_OP = 'UPDATE') THEN
@@ -121,8 +127,8 @@ BEGIN
                 'action', 'UPDATE',
                 'client_id', NEW.id,
                 'image_path', NEW.image_path,
-                'first_name', NEW.fname,
-                'last_name', NEW.lname
+                'fname', NEW.fname,
+                'lname', NEW.lname
             )::text);
         END IF;
         RETURN NEW;
@@ -294,7 +300,7 @@ BEGIN
         COUNT(DISTINCT locker_number)::integer as total_lockers_used,
         json_agg(json_build_object(
             'client_id', gs.client_id,
-            'name', c.first_name || ' ' || c.last_name,
+            'name', c.fname || ' ' || c.lname,
             'entrance_time', gs.entrance_time,
             'locker', gs.locker_number
         )) as active_sessions
