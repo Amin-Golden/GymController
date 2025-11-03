@@ -194,7 +194,7 @@ class UDPFingerprintReceiver:
                 print(f"✗ Error receiving data: {e}")
                 return None
         
-        print("\n✗ Timeout waiting for fingerprint image")
+        # print("\n✗ Timeout waiting for fingerprint image")
         return None
     
     def close(self):
