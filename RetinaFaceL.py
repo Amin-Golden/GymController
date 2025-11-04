@@ -21,8 +21,11 @@ import ctypes
 from ctypes import *
 import traceback
 from functools import lru_cache
+<<<<<<< HEAD
 from fingerprint_gym import FingerprintGymSystem, enroll_fingerprint_standalone, identify_fingerprint_standalone
 from fingerprint_gym import DualESP32FingerprintSystem
+=======
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
 
 HEADLESS = os.environ.get('DISPLAY') is None
 
@@ -80,6 +83,7 @@ class TimedCache:
 client_info_cache = TimedCache(max_age=30)  # Cache for 30 seconds
 membership_cache = TimedCache(max_age=30)
 
+<<<<<<< HEAD
 # Global in-memory caches for face embeddings and fingerprints
 registered_faces_cache = []  # Loaded at startup, updated on notifications
 registered_fingerprints_cache = []  # Loaded at startup, updated on notifications
@@ -226,6 +230,8 @@ class BiometricCache:
         with self.lock:
             return self.fingerprints.copy()
 
+=======
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
 # Cached wrapper for get_client_info
 def get_client_info_cached(client_id):
     """Get client info with caching to reduce database load"""
@@ -458,12 +464,19 @@ def safe_socket_send(sock, data, address, timeout=0.1):
 class FaceEnrollmentProcessor:
     """Handles automatic face enrollment when new members are added"""
     
+<<<<<<< HEAD
     def __init__(self, db_helper, rknn_face, face_model_size=(112, 112), biometric_cache=None, fingerprint_system=None):
         self.db = db_helper
         self.rknn_face = rknn_face
         self.face_model_size = face_model_size
         self.biometric_cache = biometric_cache
         self.fingerprint_system = fingerprint_system
+=======
+    def __init__(self, db_helper, rknn_face, face_model_size=(112, 112)):
+        self.db = db_helper
+        self.rknn_face = rknn_face
+        self.face_model_size = face_model_size
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         self.processing_queue = Queue()
         self.is_running = True
         
@@ -471,9 +484,15 @@ class FaceEnrollmentProcessor:
         self.process_thread = threading.Thread(target=self._process_queue, daemon=True)
         self.process_thread.start()
         
+<<<<<<< HEAD
     def enqueue_client(self, client_id):
         """Add client to processing queue"""
         self.processing_queue.put(client_id)
+=======
+    def enqueue_client(self, client_id, image_path):
+        """Add client to processing queue"""
+        self.processing_queue.put((client_id, image_path))
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         print(f"📋 Queued client {client_id} for embedding extraction")
         
     def _process_queue(self):
@@ -481,13 +500,19 @@ class FaceEnrollmentProcessor:
         while self.is_running:
             try:
                 if not self.processing_queue.empty():
+<<<<<<< HEAD
                     client_id = self.processing_queue.get()
                     self._process_client(client_id)
+=======
+                    client_id, image_path = self.processing_queue.get()
+                    self._process_client(client_id, image_path)
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 else:
                     time.sleep(0.5)
             except Exception as e:
                 print(f"❌ Error in processing queue: {e}")
                 
+<<<<<<< HEAD
     def _process_client(self, client_id):
         """Process a single client's face image"""
         try:
@@ -497,11 +522,42 @@ class FaceEnrollmentProcessor:
             img = self.db.get_client_image(client_id)
             if img is None:
                 print(f"❌ No image data available for client {client_id}")
+=======
+    def _process_client(self, client_id, image_path):
+        """Process a single client's face image"""
+        try:
+            print(f"🔄 Processing client {client_id}...")
+            # print(f"📁 Image path: {image_path}")
+
+            if not image_path:
+                print(f"❌ No image path provided for client {client_id}")
+                return
+            # Check if image path exists
+            if not os.path.exists(image_path):
+                print(f"⚠️  Image not found: {image_path}")
+                # Try to get client info and convert path again
+                client_info = self.get_client_info_cached(client_id)
+                if client_info and client_info.get('image_path'):
+                    image_path = client_info['image_path']
+                    # print(f"🔄 Retrying with converted path: {image_path}")
+                    
+                    if not os.path.exists(image_path):
+                        print(f"❌ Image still not found after path conversion")
+                        return
+                else:
+                    return
+            
+            # Read image
+            img = cv2.imread(image_path)
+            if img is None:
+                print(f"❌ Failed to read image: {image_path}")
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 return
             
             # Process image for face detection
             model_height, model_width = (320, 320)
             letterbox_img, aspect_ratio, offset_x, offset_y = letterbox_resize(img, (model_height, model_width), 114)
+<<<<<<< HEAD
             if letterbox_img is None:
                 print(f"❌ Failed to preprocess image for client {client_id}")
                 return
@@ -525,10 +581,32 @@ class FaceEnrollmentProcessor:
             boxes[...,1::2] = np.clip((boxes[...,1::2] - offset_y) / aspect_ratio, 0, img.shape[0])
             scores = conf.squeeze(0)[:, 1]
             landmarks = decode_landm(landmarks.squeeze(0), priors)
+=======
+            infer_img = np.expand_dims(letterbox_img, 0)
+            
+            # Detect face (you need to pass rknn for detection)
+            # For now, we'll assume the image contains a face and process the whole face
+            # You may want to add face detection here using your RetinaFace model
+            
+            # Inference
+            # outputs = rknn.inference(inputs=[infer_img])
+            with rknn_lock:
+                outputs = rknn.inference(inputs=[infer_img])
+            loc, conf, landmarks = outputs
+            priors = PriorBox(image_size=(model_height, model_width))
+            boxes = box_decode(loc.squeeze(0), priors)
+            scale = np.array([model_width, model_height,model_width, model_height])
+            boxes = boxes * scale // 1  # face box
+            boxes[...,0::2] =np.clip((boxes[...,0::2] - offset_x) / aspect_ratio, 0, img_width)  #letterbox
+            boxes[...,1::2] =np.clip((boxes[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
+            scores = conf.squeeze(0)[:, 1]  # face score
+            landmarks = decode_landm(landmarks.squeeze(0), priors)  # face keypoint data
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
             scale_landmarks = np.array([model_width, model_height, model_width, model_height,
                                         model_width, model_height, model_width, model_height,
                                         model_width, model_height])
             landmarks = landmarks * scale_landmarks // 1
+<<<<<<< HEAD
             landmarks[...,0::2] = np.clip((landmarks[...,0::2] - offset_x) / aspect_ratio, 0, img.shape[1])
             landmarks[...,1::2] = np.clip((landmarks[...,1::2] - offset_y) / aspect_ratio, 0, img.shape[0])
             
@@ -539,15 +617,31 @@ class FaceEnrollmentProcessor:
             boxes = boxes[inds]
             landmarks = landmarks[inds]
             scores = scores[inds]
+=======
+            landmarks[...,0::2] = np.clip((landmarks[...,0::2] - offset_x) / aspect_ratio, 0, img_width) #letterbox
+            landmarks[...,1::2] = np.clip((landmarks[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
+            # ignore low scores
+            inds = np.where(scores > 0.1)[0]
+            boxes = boxes[inds]
+            landmarks = landmarks[inds]
+            scores = scores[inds]
+
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
             order = scores.argsort()[::-1]
             boxes = boxes[order]
             landmarks = landmarks[order]
             scores = scores[order]
+<<<<<<< HEAD
+=======
+
+            # NMS
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
             dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
             keep = nms(dets, 0.5)
             dets = dets[keep, :]
             landmarks = landmarks[keep]
             dets = np.concatenate((dets, landmarks), axis=1)
+<<<<<<< HEAD
             
             for data in dets:
                 if data[4] < 0.9:
@@ -619,6 +713,54 @@ class FaceEnrollmentProcessor:
                                 threading.Thread(target=_enroll_fingerprint_bg, daemon=True).start()
                         except Exception as _e:
                             print(f"❌ Could not trigger fingerprint enrollment: {_e}")
+=======
+            detected_client_ids = []
+            for data in dets:
+                if data[4] < 0.9:
+                    continue
+                # print("face @ (%d %d %d %d) %f"%(data[0], data[1], data[2], data[3], data[4]))
+                text = "{:.4f}".format(data[4])
+                data = list(map(int, data))
+                dx =  data[7] - data[5]
+                dy = data[8] - data[6]
+                angle = math.atan2(dy, dx) * 180. / math.pi  # Convert radians to degrees
+
+                # Calculate the center point between the eyes, which will be the rotation center
+                eye_center = ((data[5] + data[7]) // 2,(data[6] + data[8]) // 2)
+
+                # Get the rotation matrix for the calculated angle and center
+                # We use a scale of 1.0 to ensure the face size remains the same.
+                rotation_matrix = cv2.getRotationMatrix2D(eye_center, angle, scale=1.0)
+
+                # Get the dimensions of the image
+                (h, w) = img.shape[:2]
+
+                # Apply the affine transformation (rotation) to the image
+                aligned_img = cv2.warpAffine(img, rotation_matrix, (w, h))
+
+                face_img = aligned_img[(data[1]): (data[3]), (data[0]):(data[2])]
+                letterbox_face, Faspect_ratio, Foffset_x, Foffset_y = letterbox_resize(face_img, (Face_model_height,Face_model_width), 114)  # letterbox缩放
+                # infer_img = letterbox_img[..., ::-1]  # BGR2RGB
+                # if not HEADLESS:
+                #     cv2.namedWindow("Face", cv2.WINDOW_AUTOSIZE)
+                #     cv2.imshow("Face", letterbox_face)
+                Finfer_img = np.expand_dims(letterbox_face, 0)
+                # outputs = rknnFace.inference(inputs=[Finfer_img])
+                with rknnFace_lock:
+                    outputs = rknnFace.inference(inputs=[Finfer_img])
+            
+                if len(outputs) > 0:
+                    embedding = outputs[0][0].astype(np.float32)
+                    
+                    # Save to database
+                    success = self.db.save_face_embedding(client_id, embedding, confidence=1.0)
+                    
+                    if success:
+                        client_info = self.get_client_info_cached(client_id)
+                        name = f"{client_info['fname']} {client_info['lname']}" if client_info else "Unknown"
+                        print(f"✅ Successfully enrolled: {name} (ID: {client_id})")
+                        reload_embeddings()
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                     else:
                         print(f"❌ Failed to save embedding for client {client_id}")
                 else:
@@ -669,6 +811,7 @@ def ps3camLoad():
 
     return lib 
 
+<<<<<<< HEAD
 def enroll_fingerprint_for_client(client_id, client_name, biometric_cache_ref=None):
     """
     Enroll fingerprint for a client during gym entry/setup
@@ -896,6 +1039,8 @@ def on_locker_fingerprint(client_id, client_name, confidence):
     except Exception as e:
         print(f"❌ Error unlocking locker: {e}")
 
+=======
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RetinaFace Python Demo', add_help=True)
     # basic params
@@ -921,9 +1066,13 @@ if __name__ == '__main__':
         port=5432,
         mount_point=args.mount_point
         )
+<<<<<<< HEAD
     print("🖐️ Initializing fingerprint system...")
     
     print("🖐️ Fingerprint system initialized")
+=======
+    
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
     tm = cv2.TickMeter()
     sock = None
     cap = None
@@ -935,6 +1084,7 @@ if __name__ == '__main__':
     esp32_2_port = 4210
     raspi_ip = "192.168.1.110"
     raspi_port = 4210
+<<<<<<< HEAD
     espcam_ip = "192.168.1.111"
     espcam_port = 4210
 
@@ -953,6 +1103,12 @@ if __name__ == '__main__':
         #     identification_callback=on_fingerprint_identified,  # Callback when fingerprint identified
         #     sock=sock  # Pass socket for sending messages
         # )
+=======
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         # Load all registered face embeddings from database
         # embedding_shape = (512,)  # ArcFace embedding size
         # registered_faces = db.get_all_face_embeddings(embedding_shape)
@@ -993,6 +1149,7 @@ if __name__ == '__main__':
 
         rknn_lock = threading.Lock()
         rknnFace_lock = threading.Lock()
+<<<<<<< HEAD
         
         # Initialize biometric cache FIRST (before callbacks)
         biometric_cache = BiometricCache(db)
@@ -1005,11 +1162,16 @@ if __name__ == '__main__':
         # Initialize face enrollment processor (pass cache and fingerprint system)
         enrollment_processor = FaceEnrollmentProcessor(db, rknnFace, biometric_cache=biometric_cache, fingerprint_system=fingerprint_system)
         
+=======
+        # Initialize face enrollment processor
+        enrollment_processor = FaceEnrollmentProcessor(db, rknnFace)
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         # Define callback for database notifications
         def on_client_change(notification):
             """Handle database change notifications"""
             action = notification.get('action')
             client_id = notification.get('client_id')
+<<<<<<< HEAD
             image_changed = notification.get('image_changed', False)
             
             print(f"📢 Client {action}: ID={client_id}")
@@ -1066,6 +1228,37 @@ if __name__ == '__main__':
             biometric_cache.reload_faces()
             registered_faces_cache[:] = biometric_cache.get_faces()
             print(f"🔄 Reloaded {len(registered_faces_cache)} registered faces")
+=======
+            image_path = notification.get('image_path')
+            
+            print(f"📢 Client {action}: ID={client_id}")
+            
+        
+            if image_path:
+                # Check if embedding already exists
+                if action == 'UPDATE' :
+                    db.delete_face_embedding( client_id)
+                    # enrollment_processor.enqueue_client(client_id, image_path)
+                if not db.check_embedding_exists(client_id):
+                    enrollment_processor.enqueue_client(client_id, image_path)
+                else:
+                    print(f"ℹ️  Embedding already exists for client {client_id}")
+        # Start listening for database changes
+        db.start_listening(on_client_change)
+
+        # Load all registered face embeddings from database
+        embedding_shape = (512,)
+        # print("📥 Loading registered faces from database...")
+        registered_faces = db.get_all_face_embeddings(embedding_shape)
+        print(f"✅ Loaded {len(registered_faces)} registered faces")
+
+        # Function to reload embeddings (call periodically or on notification)
+        def reload_embeddings():
+            global registered_faces
+            registered_faces = db.get_all_face_embeddings(embedding_shape)
+            # print(f"registered_face:", registered_faces)
+            print(f"🔄 Reloaded {len(registered_faces)} registered faces")
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
 
         # ADD THIS: Locker assignment tracking
         global last_locker_open
@@ -1217,8 +1410,12 @@ if __name__ == '__main__':
         # GStreamer pipeline for low-latency RTSP
     # rtph264depay converts the stream, and queue drops old frames.
         deviceId = 8
+<<<<<<< HEAD
         # camrsstp = "rtsp://192.168.1.110:8554/live"
         camrstp = "rtsp://192.168.1.111:554/"
+=======
+        camrstp = "rtsp://192.168.1.110:8554/live"
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
 
         def open_stream():
             try:
@@ -1230,8 +1427,12 @@ if __name__ == '__main__':
                 "videoconvert ! video/x-raw,format=BGR ! "
                 "appsink max-buffers=1 drop=true"
                 )
+<<<<<<< HEAD
                 # cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
                 cap = cv2.VideoCapture(0)
+=======
+                cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 if cap.isOpened():
                     print("✅ SUCCESS! Pipeline 1 works!")
                     return cap
@@ -1246,8 +1447,11 @@ if __name__ == '__main__':
                 return None
                 
         cap = open_stream()
+<<<<<<< HEAD
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+=======
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         retry_count = 0
         max_retries = 15
         consecutive_errors = 0
@@ -1289,6 +1493,7 @@ if __name__ == '__main__':
         
         print("🎬 Starting main recognition loop...")
         print("=" * 60)
+<<<<<<< HEAD
         
         def process_locker_camera_frame(frame):
             if frame is None:
@@ -1476,6 +1681,8 @@ if __name__ == '__main__':
                     continue
             return frame
 
+=======
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         def process_usb_camera_frame(frame):
             """Process frame from USB camera for locker assignment"""
             if frame is None:
@@ -1513,8 +1720,13 @@ if __name__ == '__main__':
             scores = conf.squeeze(0)[:, 1]
             landmarks = decode_landm(landmarks.squeeze(0), priors)
             if len(landmarks) == 0:
+<<<<<<< HEAD
                 # tm.stop()
                 # tm.reset()
+=======
+                tm.stop()
+                tm.reset()
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 return frame
                 
             scale_landmarks = np.array([model_width, model_height, model_width, model_height,
@@ -1527,8 +1739,13 @@ if __name__ == '__main__':
             # Filter low scores
             inds = np.where(scores > 0.1)[0]
             if len(inds) == 0:
+<<<<<<< HEAD
                 # tm.stop()
                 # tm.reset()
+=======
+                tm.stop()
+                tm.reset()
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 return frame
             
             boxes = boxes[inds]
@@ -1544,8 +1761,13 @@ if __name__ == '__main__':
             dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
             keep = nms(dets, 0.5)
             if len(keep) == 0:
+<<<<<<< HEAD
                 # tm.stop()
                 # tm.reset()
+=======
+                tm.stop()
+                tm.reset()
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 return frame
             
             dets = dets[keep, :]
@@ -1587,7 +1809,11 @@ if __name__ == '__main__':
                             best_match = None
                             best_similarity = 0.0
                             
+<<<<<<< HEAD
                             for registered_face in registered_faces_cache:
+=======
+                            for registered_face in registered_faces:
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                                 sim = Similarity(registered_face['embedding'], current_embedding)
                                 # print(f"sim", sim,registered_face['name'])
                                 if sim > best_similarity:
@@ -1657,6 +1883,7 @@ if __name__ == '__main__':
         while cv2.waitKey(1) < 0:
             try:
                 frame_count += 1
+<<<<<<< HEAD
                 # tm.start()
                 # if frame_count % 300 == 0:  # Every 10 seconds
                 #     check_db_pool_health()
@@ -1685,6 +1912,16 @@ if __name__ == '__main__':
                 #         break
                 #     continue
                 retry_count = 0
+=======
+                tm.start()
+                if frame_count % 300 == 0:  # Every 10 seconds
+                    check_db_pool_health()
+                # Periodically reload embeddings
+                if time.time() - last_reload_time > reload_interval:
+                    reload_embeddings()
+                    last_reload_time = time.time()
+            
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 ret, img = cap.read()
                 if not ret or img is None:
                     print("⚠️ Stream broken. Reconnecting...")
@@ -1699,6 +1936,7 @@ if __name__ == '__main__':
                         break
                     continue
                 retry_count = 0
+<<<<<<< HEAD
                 # cv2.normalize(img, img, 0, 255, cv2.NORM_MINMAX)
                 locker_cam = process_locker_camera_frame(img)
 
@@ -1707,6 +1945,226 @@ if __name__ == '__main__':
         
                 
                 
+=======
+                if ps3Cap.ps3eye_get_frame(buffer) == 0:
+                    print("Failed to get frame")
+                    break
+                # ret, frame = usb_cam.read()
+                # if not ret or frame is None:
+                #     print("Failed to get frame")
+                #     # ps3Cap = ps3camLoad()
+                #     usb_cam = cv2.VideoCapture(0)
+                #     retry_count += 1
+                #     if retry_count > 15:
+                #         print("Too many retries, resetting ps3camLoad...")
+                #         break
+                #     continue
+                retry_count = 0
+
+                # Convert to numpy array
+                frame = np.frombuffer(buffer, dtype=np.uint8)
+                frame = frame.reshape((480, 640, 3))
+
+                usb_img = process_usb_camera_frame(frame)
+                # if usb_img is None:
+                #     continue
+                retry_count = 0  # reset retries after success
+        
+                letterbox_img, aspect_ratio, offset_x, offset_y = letterbox_resize(img, (model_height,model_width), 114)  # letterbox缩放
+                if letterbox_img is None:
+                    print("Letterbox resize failed, skipping frame")
+                    continue
+                # infer_img = letterbox_img[..., ::-1]  # BGR2RGB
+                # cv2.namedWindow("Face", cv2.WINDOW_AUTOSIZE)
+                # cv2.imshow("Face", infer_img)
+                infer_img = np.expand_dims(letterbox_img, 0)
+
+                try:
+                    # Inference
+                    # outputs = rknn.inference(inputs=[infer_img])
+                    with rknn_lock:
+                        outputs = rknn.inference(inputs=[infer_img])
+                    if outputs is None or len(outputs) < 3:
+                        print("Invalid inference output, skipping frame")
+                        continue
+                    loc, conf, landmarks = outputs
+
+                except Exception as e:
+                    print("Inference failed:", e)
+                    continue
+
+                priors = PriorBox(image_size=(model_height, model_width))
+                if len(priors) == 0:
+                    continue
+                boxes = box_decode(loc.squeeze(0), priors)
+                if len(boxes) == 0:
+                    tm.stop()
+                    tm.reset()
+                    continue
+                scale = np.array([model_width, model_height,
+                                model_width, model_height])
+                boxes = boxes * scale // 1  # face box
+                boxes[...,0::2] =np.clip((boxes[...,0::2] - offset_x) / aspect_ratio, 0, img_width)  #letterbox
+                boxes[...,1::2] =np.clip((boxes[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
+                scores = conf.squeeze(0)[:, 1]  # face score
+                landmarks = decode_landm(landmarks.squeeze(
+                    0), priors)  # face keypoint data
+                if len(landmarks) == 0:
+                    tm.stop()
+                    tm.reset()
+                    continue
+                scale_landmarks = np.array([model_width, model_height, model_width, model_height,
+                                            model_width, model_height, model_width, model_height,
+                                            model_width, model_height])
+                landmarks = landmarks * scale_landmarks // 1
+                landmarks[...,0::2] = np.clip((landmarks[...,0::2] - offset_x) / aspect_ratio, 0, img_width) #letterbox
+                landmarks[...,1::2] = np.clip((landmarks[...,1::2] - offset_y) / aspect_ratio, 0, img_height) #letterbox
+                # ignore low scores
+                inds = np.where(scores > 0.1)[0]
+                if len(inds) == 0:
+                    tm.stop()
+                    tm.reset()
+                    continue
+                boxes = boxes[inds]
+                landmarks = landmarks[inds]
+                scores = scores[inds]
+
+                order = scores.argsort()[::-1]
+                boxes = boxes[order]
+                landmarks = landmarks[order]
+                scores = scores[order]
+
+                # NMS
+                dets = np.hstack((boxes, scores[:, np.newaxis])).astype(
+                    np.float32, copy=False)
+                keep = nms(dets, 0.5)
+                if len(keep) == 0:
+                    tm.stop()
+                    tm.reset()
+                    continue
+                dets = dets[keep, :]
+                landmarks = landmarks[keep]
+                dets = np.concatenate((dets, landmarks), axis=1)
+                detected_client_ids = []
+                for data in dets:
+                    try:
+                        if data[4] < 0.85:
+                            continue
+                        # print("face @ (%d %d %d %d) %f"%(data[0], data[1], data[2], data[3], data[4]))
+                        text = "{:.4f}".format(data[4])
+                        data = list(map(int, data))
+                        dx =  data[7] - data[5]
+                        dy = data[8] - data[6]
+                        angle = math.atan2(dy, dx) * 180. / math.pi  # Convert radians to degrees
+
+                        # Calculate the center point between the eyes, which will be the rotation center
+                        eye_center = ((data[5] + data[7]) // 2,(data[6] + data[8]) // 2)
+                        # We use a scale of 1.0 to ensure the face size remains the same.
+                        rotation_matrix = cv2.getRotationMatrix2D(eye_center, angle, scale=1.0)
+
+                        # Get the dimensions of the image
+                        (h, w) = img.shape[:2]
+
+                        # Apply the affine transformation (rotation) to the image
+                        aligned_img = cv2.warpAffine(img, rotation_matrix, (w, h))
+
+                        # face_img = aligned_img[(data[1]): (data[3]), (data[0]):(data[2])]
+                        face_img = safe_extract_face(aligned_img, data)
+
+                        if face_img.size == 0:
+                            continue
+                            
+                        letterbox_face, Faspect_ratio, Foffset_x, Foffset_y = letterbox_resize(face_img, (Face_model_height,Face_model_width), 114)  # letterbox缩放
+                        if letterbox_face is None:
+                            continue
+                        # infer_img = letterbox_img[..., ::-1]  # BGR2RGB
+                        # if not HEADLESS:    
+                        #     cv2.namedWindow("Face", cv2.WINDOW_AUTOSIZE)
+                        #     cv2.imshow("Face", letterbox_face)
+                        Finfer_img = np.expand_dims(letterbox_face, 0)
+                        try:
+                            # outputs = rknnFace.inference(inputs=[Finfer_img])
+                            with rknnFace_lock:
+                                outputs = rknnFace.inference(inputs=[Finfer_img])
+                            # Then replace your code with this:
+                            if len(outputs) > 0:
+                                current_embedding = outputs[0][0]
+                                best_match = None
+                                best_similarity = 0.0
+                                
+                                for registered_face in registered_faces:
+                                    sim = Similarity(registered_face['embedding'], current_embedding)
+                                    if sim > best_similarity:
+                                        best_similarity = sim
+                                        best_match = registered_face
+                                
+                                if best_similarity > 0.6:  # Adjust threshold as needed
+                                    client_id = best_match['client_id']
+                                    client_name = best_match['name']
+                                    
+                                    print(f"Access GRANTED: {client_name} (ID: {client_id}), Confidence: {best_similarity:.2f}")
+                                    
+                                    # Get locker number
+                                    client_info = get_client_info_cached(client_id)
+                                    
+                                    if client_info and client_info['locker'] is not None:
+                                        locker_number = client_info['locker'] + 1
+                                        current_time = time.time()
+                                        
+                                        # Check cooldown for this locker
+                                        if locker_number in last_locker_unlock:
+                                            time_since_last_unlock = current_time - last_locker_unlock[locker_number]
+                                            
+                                            if time_since_last_unlock < locker_unlock_cooldown:
+                                                remaining_time = int(locker_unlock_cooldown - time_since_last_unlock)
+                                                print(f"⏳ Locker {locker_number} cooldown active: {remaining_time}s remaining")
+                                                print(f"   Please wait before unlocking again")
+                                                continue  # Skip this iteration
+                                        
+                                        # Cooldown passed or first unlock - proceed
+                                        locker_numbers = locker_number 
+                                        sock.sendto(str(locker_number).encode("utf-8"), (raspi_ip, raspi_port))
+                                        safe_socket_send(sock, str(locker_number).encode("utf-8"), (raspi_ip, raspi_port))
+                                        if locker_numbers > 0 and locker_numbers < 25:
+                                            # safe_socket_send(sock, str(locker_number).encode("utf-8"), (esp32_1_ip, esp32_1_port))
+                                            sock.sendto(str(locker_numbers).encode("utf-8"), (esp32_1_ip, esp32_1_port))
+                                        elif locker_numbers > 25 and locker_numbers < 61:
+                                            # safe_socket_send(sock, str(locker_numbers).encode("utf-8"), (esp32_2_ip, esp32_2_port))
+                                            sock.sendto(str(locker_numbers).encode("utf-8"), (esp32_2_ip, esp32_2_port))
+
+
+                                        # Update last unlock time
+                                        last_locker_unlock[locker_number] = current_time
+                                        
+                                        print(f"✅ Locker {locker_number} unlocked at {time.strftime('%H:%M:%S', time.localtime(current_time))}")
+                                    else:
+                                        print(f"⚠️  Client {client_name} has no locker assigned")
+                                    
+                                    # Log access
+                                    db.log_access(client_id, True, float(best_similarity))
+                                else:
+                                    print(f"Access DENIED: Unknown person, Best match: {best_similarity:.2f}")
+                                    db.log_access(None, False, float(best_similarity))
+                        except Exception as e:
+                            print(f"Face recognition error: {e}")
+                    
+                    except Exception as e:
+                        print(f"Error processing detection: {e}")
+                        continue
+                try:
+                    tm.stop()
+                    # print('FPS! ',tm.getFPS())
+                    if not HEADLESS:
+                        cv2.namedWindow("STREAM CAM", cv2.WINDOW_FULLSCREEN)
+                        cv2.imshow("STREAM CAM", img)
+                        cv2.namedWindow("USB CAM", cv2.WINDOW_FULLSCREEN)
+                        cv2.imshow("USB CAM", usb_img)
+                    
+                except Exception as e:
+                    print(f"Display error: {e}")
+                
+                tm.reset()
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
             
             except KeyboardInterrupt:
                 print("\nInterrupted by user")
@@ -1721,6 +2179,7 @@ if __name__ == '__main__':
                 time.sleep(0.1)
                 continue
         
+<<<<<<< HEAD
             try:
                 # tm.stop()
                 # print('FPS! ',tm.getFPS())
@@ -1732,6 +2191,8 @@ if __name__ == '__main__':
             
             except Exception as e:
                 print(f"Display error: {e}")
+=======
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
     # cv2.imwrite(img_path, img)
     # print("save image in", img_path)
     except Exception as e:
@@ -1741,6 +2202,10 @@ if __name__ == '__main__':
     finally:
         # Cleanup
         print("\n🛑 Shutting down...")
+<<<<<<< HEAD
+=======
+        enrollment_processor.stop()
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         db.stop_listening()
         db.close_all_connections()
         if rknn is not None:
@@ -1768,6 +2233,7 @@ if __name__ == '__main__':
             cv2.destroyAllWindows()
         except:
             pass
+<<<<<<< HEAD
         enrollment_processor.stop()        
         # Add fingerprint cleanup
         if  fingerprint_system:
@@ -1776,5 +2242,7 @@ if __name__ == '__main__':
                 print("✓ Fingerprint system closed")
             except:
                 pass
+=======
+>>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         print("✅ Shutdown complete")
         
