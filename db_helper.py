@@ -558,7 +558,7 @@ class DatabaseHelper:
                     m.status,
                     m.start_date,
                     m.end_date,
-                    p.package_name,
+                    p.packagename,
                     m.is_paid
                 FROM clients c
                 LEFT JOIN memberships m ON c.id = m.client_id  
@@ -1317,12 +1317,13 @@ class DatabaseHelper:
     # FINGERPRINT METHODS
     # ========================================
 
-    def save_fingerprint_features(self, client_id, features_list):
+    def save_fingerprint_features(self, client_id, finger_index, features_list):
         """
-        Save 5 fingerprint feature samples for a client
+        Save fingerprint feature samples for a specific finger (1 or 2)
         
         Args:
             client_id: Client ID
+            finger_index: 1 or 2 (which finger)
             features_list: List of 5 feature dictionaries with keys:
                           'descriptors', 'keypoints', 'num_features', 'confidence'
         
@@ -1341,8 +1342,8 @@ class DatabaseHelper:
             
             cursor = connection.cursor()
             
-            # Delete existing fingerprints for this client
-            cursor.execute("DELETE FROM fingerprint_features WHERE client_id = %s", (client_id,))
+            # Delete existing fingerprints for this client and finger_index
+            cursor.execute("DELETE FROM fingerprint_features WHERE client_id = %s AND finger_index = %s", (client_id, finger_index))
             
             # Insert each sample
             for idx, features in enumerate(features_list, start=1):
@@ -1364,12 +1365,13 @@ class DatabaseHelper:
                 
                 query = """
                     INSERT INTO fingerprint_features 
-                    (client_id, sample_number, descriptors, keypoints_data, num_features, confidence, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (client_id, finger_index, sample_number, descriptors, keypoints_data, num_features, confidence, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """
                 
                 cursor.execute(query, (
                     client_id,
+                    finger_index,
                     idx,
                     psycopg2.Binary(descriptors_binary),
                     psycopg2.Binary(keypoints_binary),
@@ -1397,10 +1399,10 @@ class DatabaseHelper:
 
     def get_fingerprint_features(self, client_id):
         """
-        Retrieve all fingerprint features for a client
+        Retrieve all fingerprint features for a client, grouped by finger
         
         Returns:
-            List of feature dictionaries or empty list if not found
+            List of dicts: [{'finger_index': 1, 'samples': [features...]}, {'finger_index': 2, 'samples': [...]}]
         """
         connection = None
         try:
@@ -1411,19 +1413,20 @@ class DatabaseHelper:
             cursor = connection.cursor()
             
             query = """
-                SELECT sample_number, descriptors, keypoints_data, num_features, confidence
+                SELECT finger_index, sample_number, descriptors, keypoints_data, num_features, confidence
                 FROM fingerprint_features
                 WHERE client_id = %s
-                ORDER BY sample_number
+                ORDER BY finger_index, sample_number
             """
             cursor.execute(query, (client_id,))
             
             results = cursor.fetchall()
             cursor.close()
             
-            features_list = []
+            # Group by finger_index
+            grouped = {}
             for row in results:
-                sample_num, desc_binary, kp_binary, num_feat, conf = row
+                finger_index, sample_num, desc_binary, kp_binary, num_feat, conf = row
                 
                 # Convert from binary
                 descriptors = np.frombuffer(desc_binary, dtype=np.float32)
@@ -1435,16 +1438,22 @@ class DatabaseHelper:
                     descriptors = descriptors.reshape(-1, 32)
                 
                 keypoints = pickle.loads(kp_binary) if kp_binary else []
-                
-                features_list.append({
+                sample = {
                     'sample_number': sample_num,
                     'descriptors': descriptors,
                     'keypoints': keypoints,
                     'num_features': num_feat,
                     'confidence': conf
-                })
+                }
+                grouped.setdefault(finger_index, []).append(sample)
             
-            return features_list
+            result = []
+            for fidx, samples in grouped.items():
+                result.append({
+                    'finger_index': fidx,
+                    'samples': samples
+                })
+            return result
             
         except Exception as e:
             print(f"❌ Error retrieving fingerprint features: {e}")
@@ -1483,12 +1492,17 @@ class DatabaseHelper:
             
             result = []
             for client_id, fname, lname in clients:
-                features_list = self.get_fingerprint_features(client_id)
-                if features_list:
+                fingers = self.get_fingerprint_features(client_id)  # grouped by finger
+                if fingers:
+                    # Backward-compatible flat list of all samples across both fingers
+                    flat_samples = []
+                    for f in fingers:
+                        flat_samples.extend(f.get('samples', []))
                     result.append({
                         'client_id': client_id,
                         'name': f"{fname} {lname}",
-                        'fingerprints': features_list
+                        'fingers': fingers,
+                        'fingerprints': flat_samples
                     })
             
             return result

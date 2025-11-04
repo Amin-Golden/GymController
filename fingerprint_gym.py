@@ -23,7 +23,8 @@ EXPECTED_MARKER = b"FPIMG\0\0\0"
 END_MARKER = b"FPIMGEND"
 
 # Fingerprint matching parameters
-FINGERPRINTS_PER_CLIENT = 5
+FINGERS_PER_CLIENT = 2
+SAMPLES_PER_FINGER = 5
 MATCH_THRESHOLD = 0.12  # Adjusted for realistic SIFT/ORB matching
 
 # ESP32 endpoints for feedback
@@ -150,7 +151,7 @@ class UDPFingerprintReceiver:
         Receive a complete fingerprint image
         Returns: numpy array of image or None
         """
-        print("\n⏳ Waiting for fingerprint image...")
+        # print("\n⏳ Waiting for fingerprint image...")
         start_time = time.time()
         
         header_received = False
@@ -301,9 +302,12 @@ class DualESP32FingerprintSystem:
         """Reload all registered fingerprints from database"""
         try:
             self.registered_fingerprints = self.db.get_all_fingerprint_features()
-            print(f"🔄 Loaded {len(self.registered_fingerprints)} fingerprint profiles")
+            total_samples = sum(len(p.get('fingerprints', [])) for p in self.registered_fingerprints)
+            print(f"🔄 Loaded {len(self.registered_fingerprints)} fingerprint profiles ({total_samples} total samples)")
         except Exception as e:
             print(f"❌ Error reloading fingerprints: {e}")
+            import traceback
+            traceback.print_exc()
             self.registered_fingerprints = []
     
     def _entrance_listener_loop(self):
@@ -394,37 +398,73 @@ class DualESP32FingerprintSystem:
         best_match = None
         best_score = 0.0
         
+        if not self.registered_fingerprints:
+            print(f"⚠️ [{source}] No fingerprints loaded in database")
+            return None
+        
+        print(f"🔍 [{source}] Checking against {len(self.registered_fingerprints)} enrolled clients...")
+        
         for person in self.registered_fingerprints:
             client_id = person['client_id']
             name = person['name']
-            fingerprints = person['fingerprints']
             
-            # Compare with all samples
+            # Get all fingerprints (could be 'fingerprints' for backward compat or 'fingers' for new structure)
+            if 'fingers' in person:
+                # New structure: grouped by fingers
+                all_samples = []
+                for finger in person['fingers']:
+                    all_samples.extend(finger.get('samples', []))
+            else:
+                # Old structure: flat list
+                all_samples = person.get('fingerprints', [])
+            
+            if not all_samples:
+                continue
+            
+            # Compare with all samples from all fingers
             scores = []
-            for enrolled_fp in fingerprints:
-                score = self.processor.match_fingerprints(features, enrolled_fp)
-                scores.append(score)
+            for enrolled_fp in all_samples:
+                try:
+                    if not isinstance(enrolled_fp, dict):
+                        continue
+                    if 'descriptors' not in enrolled_fp:
+                        continue
+                    desc = enrolled_fp.get('descriptors')
+                    if desc is None or (hasattr(desc, '__len__') and len(desc) == 0):
+                        continue
+                    score = self.processor.match_fingerprints(features, enrolled_fp)
+                    scores.append(score)
+                except Exception as e:
+                    # Skip samples that cause errors
+                    continue
             
-            # Use average of top 3 scores
+            if not scores:
+                continue
+                
+            # Use average of top 5 scores (we have 5 samples per finger, 2 fingers = 10 total)
             scores.sort(reverse=True)
-            avg_score = np.mean(scores[:3]) if len(scores) >= 3 else np.mean(scores)
+            avg_score = np.mean(scores[:5]) if len(scores) >= 5 else np.mean(scores)
             
             if avg_score > best_score:
                 best_score = avg_score
                 best_match = (client_id, name)
+                print(f"  📊 [{source}] Best so far: {name} - {avg_score*100:.1f}% ({len(scores)} valid matches)")
         
         # Check threshold
-        if best_score >= MATCH_THRESHOLD:
+        if best_match and best_score >= MATCH_THRESHOLD:
             client_id, name = best_match
             print(f"✅ [{source}] MATCH: {name} (ID: {client_id}) - {best_score*100:.1f}%")
             return (client_id, name, best_score)
         else:
-            print(f"❌ [{source}] NO MATCH - Score: {best_score*100:.1f}%")
+            if best_match:
+                print(f"❌ [{source}] NO MATCH - Best: {best_match[1]} (Score: {best_score*100:.1f}%, Threshold: {MATCH_THRESHOLD*100:.1f}%)")
+            else:
+                print(f"❌ [{source}] NO MATCH - No fingerprints found in database")
             return None
     
     def enroll_client_fingerprint(self, client_id, use_entrance_esp=True):
         """
-        Enroll 5 fingerprint samples for a client
+        Backward-compatible entry point: Enroll both fingers (1 and 2), 5 samples each
         
         Args:
             client_id: Client ID to enroll
@@ -433,10 +473,6 @@ class DualESP32FingerprintSystem:
         Returns:
             True if successful
         """
-        print(f"\n{'='*60}")
-        print(f"🖐️ FINGERPRINT ENROLLMENT - Client ID: {client_id}")
-        print(f"{'='*60}")
-        
         # Pause listeners during enrollment
         was_entrance_running = self.entrance_running
         was_locker_running = self.locker_running
@@ -446,33 +482,56 @@ class DualESP32FingerprintSystem:
         if was_locker_running:
             self.stop_locker_listener()
         
-        # Get client info
-        client_info = self.db.get_client_info(client_id)
-        if not client_info:
-            print(f"❌ Client {client_id} not found")
+        try:
+            success = self.enroll_client_two_fingers(client_id, use_entrance_esp)
+        finally:
+            # Resume listeners
             if was_entrance_running:
                 self.start_entrance_listener()
             if was_locker_running:
                 self.start_locker_listener()
+        
+        return success
+    
+    def enroll_client_single_finger(self, client_id, finger_index=1, use_entrance_esp=True):
+        """
+        Enroll 5 fingerprint samples for a specific finger (1 or 2)
+        
+        Args:
+            client_id: Client ID to enroll
+            finger_index: 1 or 2 (which finger)
+            use_entrance_esp: If True, use entrance ESP32, else use locker ESP32
+        
+        Returns:
+            True if successful
+        """
+        print(f"\n{'='*60}")
+        print(f"🖐️ FINGERPRINT ENROLLMENT - Client ID: {client_id} - Finger {finger_index}")
+        print(f"{'='*60}")
+        
+        # Get client info
+        client_info = self.db.get_client_info(client_id)
+        if not client_info:
+            print(f"❌ Client {client_id} not found")
             return False
         
         name = f"{client_info['fname']} {client_info['lname']}"
         print(f"👤 Enrolling: {name}")
         print(f"Using: {'ENTRANCE' if use_entrance_esp else 'LOCKER'} ESP32")
-        print(f"Please scan {FINGERPRINTS_PER_CLIENT} fingerprint samples...")
+        print(f"Please scan {SAMPLES_PER_FINGER} fingerprint samples for finger {finger_index}...")
         
-        fingerprints = []
         receiver = self.entrance_receiver if use_entrance_esp else self.locker_receiver
         esp_ip = ENTRANCE_ESP_IP if use_entrance_esp else LOCKER_ESP_IP
         esp_port = ENTRANCE_ESP_PORT if use_entrance_esp else LOCKER_ESP_PORT
         
-        for i in range(FINGERPRINTS_PER_CLIENT):
-            print(f"\n📌 Sample {i+1}/{FINGERPRINTS_PER_CLIENT}")
+        samples = []
+        for i in range(SAMPLES_PER_FINGER):
+            print(f"\n📌 Finger {finger_index} - Sample {i+1}/{SAMPLES_PER_FINGER}")
             
             # Send status to ESP32
             if self.sock:
                 try:
-                    sendstr = f"Sample {i+1}"
+                    sendstr = f"Finger {finger_index} - Sample {i+1}"
                     self.sock.sendto(sendstr.encode("utf-8"), (esp_ip, esp_port))
                 except:
                     pass
@@ -481,16 +540,7 @@ class DualESP32FingerprintSystem:
             image = receiver.receive_image(timeout=60.0)
             if image is None:
                 print(f"✗ Failed to receive sample {i+1}")
-                if i >= 2:
-                    print("Using partial enrollment data...")
-                    break
-                else:
-                    # Resume listeners
-                    if was_entrance_running:
-                        self.start_entrance_listener()
-                    if was_locker_running:
-                        self.start_locker_listener()
-                    return False
+                return False
             
             # Extract features
             print("🔍 Extracting features...")
@@ -500,37 +550,27 @@ class DualESP32FingerprintSystem:
                 print(f"✗ Failed to extract features from sample {i+1}")
                 continue
             
-            fingerprints.append(features)
+            samples.append(features)
             print(f"✓ Sample {i+1} captured ({features['num_features']} features)")
             
-            if i < FINGERPRINTS_PER_CLIENT - 1:
+            if i < SAMPLES_PER_FINGER - 1:
                 print("   Remove and place finger again...")
                 time.sleep(2)
         
-        if len(fingerprints) < 2:
-            print("✗ Not enough valid samples for enrollment")
-            # Resume listeners
-            if was_entrance_running:
-                self.start_entrance_listener()
-            if was_locker_running:
-                self.start_locker_listener()
+        if len(samples) < SAMPLES_PER_FINGER:
+            print("✗ Not enough valid samples for this finger")
             return False
         
-        # Save to database
-        success = self.db.save_fingerprint_features(client_id, fingerprints)
+        # Save to database with finger_index
+        success = self.db.save_fingerprint_features(client_id, finger_index, samples)
         
         if success:
-            print(f"\n{'='*60}")
-            print(f"✅ FINGERPRINT ENROLLMENT COMPLETE!")
-            print(f"  Client ID: {client_id}")
-            print(f"  Name: {name}")
-            print(f"  Samples: {len(fingerprints)}")
-            print(f"{'='*60}")
+            print(f"✅ Saved {SAMPLES_PER_FINGER} samples for finger {finger_index}")
             
             # Send success to ESP32
             if self.sock:
                 try:
-                    sendstr = f"Success {client_id}"
+                    sendstr = f"Success Finger {finger_index}"
                     self.sock.sendto(sendstr.encode("utf-8"), (esp_ip, esp_port))
                 except:
                     pass
@@ -539,16 +579,29 @@ class DualESP32FingerprintSystem:
             if self.fingerprint_cache:
                 self.fingerprint_cache.update_client_fingerprints(client_id)
             
-            # Reload fingerprints from cache
+            # Reload fingerprints
             self.reload_fingerprints()
         
-        # Resume listeners
-        if was_entrance_running:
-            self.start_entrance_listener()
-        if was_locker_running:
-            self.start_locker_listener()
-        
         return success
+    
+    def enroll_client_two_fingers(self, client_id, use_entrance_esp=True):
+        """
+        Enroll both fingers (1 and 2), 5 samples each
+        
+        Args:
+            client_id: Client ID to enroll
+            use_entrance_esp: If True, use entrance ESP32, else use locker ESP32
+        
+        Returns:
+            True if both fingers enrolled successfully
+        """
+        all_ok = True
+        for finger_index in range(1, FINGERS_PER_CLIENT + 1):
+            ok = self.enroll_client_single_finger(client_id, finger_index, use_entrance_esp)
+            all_ok = all_ok and ok
+            if not ok:
+                print(f"⚠️  Finger {finger_index} enrollment failed")
+        return all_ok
     
     def close(self):
         """Cleanup resources"""
@@ -609,12 +662,13 @@ class FingerprintGymSystem:
         
         name = f"{client_info['fname']} {client_info['lname']}"
         print(f"👤 Enrolling: {name}")
-        print(f"Please scan {FINGERPRINTS_PER_CLIENT} fingerprint samples...")
+        print(f"⚠️  Legacy class - Please use DualESP32FingerprintSystem for 2-finger enrollment")
+        print(f"Scanning {SAMPLES_PER_FINGER} samples for finger 1 only...")
         
         fingerprints = []
         
-        for i in range(FINGERPRINTS_PER_CLIENT):
-            print(f"\n📌 Sample {i+1}/{FINGERPRINTS_PER_CLIENT}")
+        for i in range(SAMPLES_PER_FINGER):
+            print(f"\n📌 Finger 1 - Sample {i+1}/{SAMPLES_PER_FINGER}")
             if self.sock:
                 try:
                     sendstr = f"Sample {i+1}"
@@ -642,16 +696,16 @@ class FingerprintGymSystem:
             fingerprints.append(features)
             print(f"✓ Sample {i+1} captured ({features['num_features']} features)")
             
-            if i < FINGERPRINTS_PER_CLIENT - 1:
+            if i < SAMPLES_PER_FINGER - 1:
                 print("   Remove and place finger again...")
                 time.sleep(2)
         
-        if len(fingerprints) < 2:
+        if len(fingerprints) < SAMPLES_PER_FINGER:
             print("✗ Not enough valid samples for enrollment")
             return False
         
-        # Save to database
-        success = self.db.save_fingerprint_features(client_id, fingerprints)
+        # Save to database (legacy: only finger 1)
+        success = self.db.save_fingerprint_features(client_id, 1, fingerprints)
         
         if success:
             print(f"\n{'='*60}")
@@ -718,21 +772,44 @@ class FingerprintGymSystem:
         for person in self.registered_fingerprints:
             client_id = person['client_id']
             name = person['name']
-            fingerprints = person['fingerprints']
+            
+            # Get all fingerprints (could be 'fingerprints' for backward compat or 'fingers' for new structure)
+            if 'fingers' in person:
+                # New structure: grouped by fingers
+                all_samples = []
+                for finger in person['fingers']:
+                    all_samples.extend(finger.get('samples', []))
+            else:
+                # Old structure: flat list
+                all_samples = person.get('fingerprints', [])
             
             print(f"  Checking {name}...", end=' ')
             
-            # Compare with all samples
+            # Compare with all samples from all fingers
             scores = []
-            for enrolled_fp in fingerprints:
-                score = self.processor.match_fingerprints(features, enrolled_fp)
-                scores.append(score)
+            for enrolled_fp in all_samples:
+                try:
+                    if not isinstance(enrolled_fp, dict):
+                        continue
+                    if 'descriptors' not in enrolled_fp:
+                        continue
+                    desc = enrolled_fp.get('descriptors')
+                    if desc is None or (hasattr(desc, '__len__') and len(desc) == 0):
+                        continue
+                    score = self.processor.match_fingerprints(features, enrolled_fp)
+                    scores.append(score)
+                except Exception as e:
+                    # Skip samples that cause errors
+                    continue
             
-            # Use average of top 3 scores
+            if not scores:
+                continue
+                
+            # Use average of top 5 scores (we have 5 samples per finger, 2 fingers = 10 total)
             scores.sort(reverse=True)
-            avg_score = np.mean(scores[:3]) if len(scores) >= 3 else np.mean(scores)
+            avg_score = np.mean(scores[:5]) if len(scores) >= 5 else np.mean(scores)
             
-            print(f"scores: {[f'{s:.3f}' for s in scores[:3]]} → avg: {avg_score:.3f} ({avg_score*100:.1f}%)")
+            print(f"scores: {[f'{s:.3f}' for s in scores[:5]]} → avg: {avg_score:.3f} ({avg_score*100:.1f}%)")
             
             if avg_score > best_score:
                 best_score = avg_score
@@ -810,17 +887,28 @@ class FingerprintGymSystem:
                 for person in self.registered_fingerprints:
                     client_id = person['client_id']
                     name = person['name']
-                    fingerprints = person['fingerprints']
                     
-                    # Compare with all samples
+                    # Get all fingerprints (could be 'fingerprints' for backward compat or 'fingers' for new structure)
+                    if 'fingers' in person:
+                        # New structure: grouped by fingers
+                        all_samples = []
+                        for finger in person['fingers']:
+                            all_samples.extend(finger.get('samples', []))
+                    else:
+                        # Old structure: flat list
+                        all_samples = person.get('fingerprints', [])
+                    
+                    # Compare with all samples from all fingers
                     scores = []
-                    for enrolled_fp in fingerprints:
+                    for enrolled_fp in all_samples:
+                        if not isinstance(enrolled_fp, dict) or 'descriptors' not in enrolled_fp or enrolled_fp.get('descriptors') is None:
+                            continue
                         score = self.processor.match_fingerprints(features, enrolled_fp)
                         scores.append(score)
                     
-                    # Use average of top 3 scores
+                    # Use average of top 5 scores (we have 5 samples per finger, 2 fingers = 10 total)
                     scores.sort(reverse=True)
-                    avg_score = np.mean(scores[:3]) if len(scores) >= 3 else np.mean(scores)
+                    avg_score = np.mean(scores[:5]) if len(scores) >= 5 else np.mean(scores) if scores else 0.0
                     
                     if avg_score > best_score:
                         best_score = avg_score

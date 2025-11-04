@@ -1770,7 +1770,7 @@ if __name__ == '__main__':
             pass
         enrollment_processor.stop()        
         # Add fingerprint cleanup
-        if fingerprint_system:
+        if  fingerprint_system:
             try:
                 fingerprint_system.close()
                 print("✓ Fingerprint system closed")
