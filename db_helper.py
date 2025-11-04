@@ -8,11 +8,8 @@ from datetime import datetime
 import threading
 import time
 import os
-<<<<<<< HEAD
 import pickle
 import cv2
-=======
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
 
 class DatabaseHelper:
     def __init__(self, host, database, user, password, port=5432, mount_point="/mnt/winshare"):
@@ -235,24 +232,15 @@ class DatabaseHelper:
                 self.return_connection(connection)
 
     def get_client_info(self, client_id):
-<<<<<<< HEAD
         """Get client information including locker status"""
-=======
-        """Get client information including image path"""
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         connection = None
         try:
             connection = self.get_connection_with_timeout()
             cursor = connection.cursor()
             
             query = """
-<<<<<<< HEAD
                 SELECT id, fname, lname, email, phone_number,
                        locker, image_data IS NOT NULL AS has_image
-=======
-                SELECT id, fname, lname, email, phone_number, 
-                       locker , image_path
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 FROM clients WHERE id = %s
             """
             cursor.execute(query, (client_id,))
@@ -261,17 +249,6 @@ class DatabaseHelper:
             cursor.close()
             
             if result:
-<<<<<<< HEAD
-=======
-                windows_path = result[6] if len(result) > 6 else None
-                # linux_path = self.convert_image_path(windows_path)
-                try:
-                    linux_path = self.convert_image_path(windows_path) if windows_path else None
-                except Exception as path_error:
-                    print(f"⚠️  Path conversion failed for client {client_id}: {path_error}")
-                    linux_path = None
-            
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 return {
                     'id': result[0],
                     'fname': result[1],
@@ -279,12 +256,7 @@ class DatabaseHelper:
                     'email': result[3],
                     'phone_number': result[4],
                     'locker': result[5],
-<<<<<<< HEAD
                     'has_image': result[6]
-=======
-                    'image_path': linux_path,  # Converted path
-                    'image_path_original': windows_path  # Keep original
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 }
             return None
             
@@ -586,7 +558,7 @@ class DatabaseHelper:
                     m.status,
                     m.start_date,
                     m.end_date,
-                    p.packagename,
+                    p.package_name,
                     m.is_paid
                 FROM clients c
                 LEFT JOIN memberships m ON c.id = m.client_id  
@@ -1140,17 +1112,12 @@ class DatabaseHelper:
         """Regenerate face embedding for a client after image update"""
         print(f"🔄 Regenerating face embedding for client {client_id}...")
         
-<<<<<<< HEAD
         # Ensure client exists
-=======
-        # Get client info
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
         client_info = self.get_client_info(client_id)
         if not client_info:
             print(f"❌ Client {client_id} not found")
             return False
         
-<<<<<<< HEAD
         img = self.get_client_image(client_id)
         if img is None:
             print(f"⚠️  No image data for client {client_id}")
@@ -1159,30 +1126,6 @@ class DatabaseHelper:
         try:
             # Generate embedding using your face recognition model
             embedding = face_recognition_model.generate_embedding(img)
-=======
-        image_path = client_info.get('image_path')
-        if not image_path:
-            print(f"⚠️  No image path for client {client_id}")
-            return False
-        
-        if not os.path.exists(image_path):
-            print(f"❌ Image file not found: {image_path}")
-            return False
-        
-        try:
-            # Import required libraries (assuming you have face recognition code)
-            import cv2
-            
-            # Read image
-            image = cv2.imread(image_path)
-            if image is None:
-                print(f"❌ Failed to read image: {image_path}")
-                return False
-            
-            # Generate embedding using your face recognition model
-            # This is a placeholder - replace with your actual face recognition code
-            embedding = face_recognition_model.generate_embedding(image)
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
             
             if embedding is None:
                 print(f"❌ Failed to generate embedding for client {client_id}")
@@ -1219,13 +1162,8 @@ class DatabaseHelper:
             
             if action == 'INSERT':
                 # New client - generate embedding
-<<<<<<< HEAD
                 image_data = payload.get('image_data')
                 if image_data:
-=======
-                image_path = payload.get('image_path')
-                if image_path:
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                     print(f"🆕 New client {client_id} - will generate embedding")
                     self.regenerate_face_embedding(client_id, face_recognition_model)
             
@@ -1318,15 +1256,9 @@ class DatabaseHelper:
             
             cursor = connection.cursor()
             
-<<<<<<< HEAD
             query = """
                 SELECT id, fname, lname, email, phone_number,
                        locker, image_data IS NOT NULL AS has_image
-=======
-            # Use IN clause for batch query
-            query = """
-                SELECT id, fname, lname, email, phone_number, locker, image_path
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 FROM clients WHERE id = ANY(%s)
             """
             cursor.execute(query, (client_ids,))
@@ -1334,10 +1266,6 @@ class DatabaseHelper:
             results = cursor.fetchall()
             cursor.close()
             
-<<<<<<< HEAD
-=======
-            # Build dictionary
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
             infos = {}
             for row in results:
                 infos[row[0]] = {
@@ -1347,11 +1275,7 @@ class DatabaseHelper:
                     'email': row[3],
                     'phone_number': row[4],
                     'locker': row[5],
-<<<<<<< HEAD
                     'has_image': row[6]
-=======
-                    'image_path': self.convert_image_path(row[6]) if row[6] else None
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 }
             
             return infos
@@ -1361,7 +1285,6 @@ class DatabaseHelper:
             return {}
         finally:
             if connection:
-<<<<<<< HEAD
                 self.return_connection(connection)
 
     def get_client_image(self, client_id):
@@ -1641,6 +1564,4 @@ class DatabaseHelper:
             return False
         finally:
             if connection:
-=======
->>>>>>> 1f906c5e3267394291201af8f3336ca2ea895b79
                 self.return_connection(connection)

@@ -577,9 +577,13 @@ class DualESP32FingerprintSystem:
             
             # Update cache if available
             if self.fingerprint_cache:
-                self.fingerprint_cache.update_client_fingerprints(client_id)
+                success_update = self.fingerprint_cache.update_client_fingerprints(client_id)
+                if success_update:
+                    # Update registered fingerprints from cache
+                    self.registered_fingerprints = self.fingerprint_cache.get_fingerprints()
+                    print(f"✅ Fingerprint cache updated in fingerprint system")
             
-            # Reload fingerprints
+            # Also reload fingerprints from database as backup
             self.reload_fingerprints()
         
         return success
