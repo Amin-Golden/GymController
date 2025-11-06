@@ -643,26 +643,48 @@ def ps3camLoad():
 
     return lib 
 
-# Global tracking for entrance fingerprint cooldown
-last_entrance_fingerprint_time = {}  # Track last entrance fingerprint time per client
-entrance_fingerprint_cooldown = 60  # 1 minute cooldown
+# Global shared cooldown for entrance operations (face and fingerprint)
+# When either system detects a client and performs entrance/exit, both systems respect the cooldown
+last_entrance_time = {}  # Track last entrance/exit time per client (shared by both systems)
+entrance_cooldown = 60  # 1 minute cooldown (shared)
+
+def check_entrance_cooldown(client_id, client_name):
+    """
+    Check if client is in cooldown period (shared by face and fingerprint systems)
+    Returns: (is_in_cooldown, remaining_seconds)
+    """
+    global last_entrance_time
+    
+    if client_id is None:
+        return True, 0
+    
+    if client_id not in last_entrance_time:
+        return False, 0
+    
+    current_time = time.time()
+    time_since_last = current_time - last_entrance_time[client_id]
+    
+    if time_since_last < entrance_cooldown:
+        remaining = int(entrance_cooldown - time_since_last)
+        return True, remaining
+    
+    return False, 0
+
+def update_entrance_cooldown(client_id):
+    """Update the shared entrance cooldown timer"""
+    global last_entrance_time
+    last_entrance_time[client_id] = time.time()
 
 def on_entrance_fingerprint(client_id, client_name, confidence):
     """Handle entrance fingerprint with cooldown and proper entry/exit logic"""
-    global last_entrance_fingerprint_time
-    
     if client_id is None:
         return
     
-    current_time = time.time()
-    
-    # Check cooldown to prevent duplicate operations
-    if client_id in last_entrance_fingerprint_time:
-        time_since_last = current_time - last_entrance_fingerprint_time[client_id]
-        if time_since_last < entrance_fingerprint_cooldown:
-            remaining = int(entrance_fingerprint_cooldown - time_since_last)
-            print(f"⏳ Entrance cooldown active for {client_name} ({remaining}s remaining)")
-            return
+    # Check shared cooldown (face and fingerprint systems share this)
+    is_cooldown, remaining = check_entrance_cooldown(client_id, client_name)
+    if is_cooldown:
+        print(f"⏳ Entrance cooldown active for {client_name} ({remaining}s remaining)")
+        return
     
     # Get client info
     client_info = get_client_info_cached(client_id)
@@ -715,8 +737,8 @@ def on_entrance_fingerprint(client_id, client_name, confidence):
         print(f"🎉 ENTRY: {client_name} → Locker #{available_locker + 1}")
         print(f"   Remaining sessions: {membership_info['remain_sessions'] - 1}")
         
-        # Update cooldown
-        last_entrance_fingerprint_time[client_id] = current_time
+        # Update shared cooldown (face and fingerprint systems share this)
+        update_entrance_cooldown(client_id)
     else:
         # EXIT - return locker (client already has locker)
         print(f"🚪 EXIT detected for {client_name}")
@@ -740,8 +762,8 @@ def on_entrance_fingerprint(client_id, client_name, confidence):
         
         print(f"👋 EXIT: {client_name} left gym")
         
-        # Update cooldown
-        last_entrance_fingerprint_time[client_id] = current_time
+        # Update shared cooldown (face and fingerprint systems share this)
+        update_entrance_cooldown(client_id)
 
 def on_locker_fingerprint(client_id, client_name, confidence):
     """
@@ -963,28 +985,21 @@ if __name__ == '__main__':
         # Locker assignment tracking
         global last_locker_open
 
-        last_locker_assignment = {}  # Track last assignment time per client
         last_locker_open = {}  # Track last open locker time per client
         locker_open_cooldown = 15 
-        locker_assignment_cooldown = 60  # seconds between assignments for same client
 
         def assign_locker_to_recognized_face(client_id, client_name, similarity):
             """
             Assign/unassign locker based on recognition in USB camera
             - Entry: Assign locker if client has active membership and no locker
             - Exit: Unassign locker if client already has one
+            Uses shared entrance cooldown with fingerprint system
             """
-            global last_locker_assignment
-            
-            current_time = time.time()
-            
-            # Check cooldown to prevent duplicate operations
-            if client_id in last_locker_assignment:
-                time_since_last = current_time - last_locker_assignment[client_id]
-                if time_since_last < locker_assignment_cooldown:
-                    remaining = int(locker_assignment_cooldown - time_since_last)
-                    print(f"⏳ Cooldown active for {client_name} ({remaining}s remaining)")
-                    return False
+            # Check shared cooldown (face and fingerprint systems share this)
+            is_cooldown, remaining = check_entrance_cooldown(client_id, client_name)
+            if is_cooldown:
+                print(f"⏳ Entrance cooldown active for {client_name} ({remaining}s remaining)")
+                return False
             
             # 1. Check if client has active membership
             membership = db.check_active_membership(client_id)
@@ -1074,7 +1089,8 @@ if __name__ == '__main__':
                 # Send locker number to ESP32
                 sock.sendto(str(available_locker+1).encode("utf-8"), (esp32_1_ip, esp32_1_port))
                 
-                last_locker_assignment[client_id] = current_time
+                # Update shared cooldown (face and fingerprint systems share this)
+                update_entrance_cooldown(client_id)
                 return True
                 
             else:
@@ -1104,7 +1120,8 @@ if __name__ == '__main__':
                 if summary:
                     print(f"   Sessions remaining: {summary['sessions']}")
                 
-                last_locker_assignment[client_id] = current_time
+                # Update shared cooldown (face and fingerprint systems share this)
+                update_entrance_cooldown(client_id)
                 return True               
         # GStreamer pipeline for low-latency RTSP
         camrstp = "rtsp://192.168.1.111:554/"
