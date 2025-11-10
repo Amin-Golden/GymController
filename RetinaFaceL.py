@@ -60,6 +60,26 @@ registered_faces_cache = []  # Loaded at startup, updated on notifications
 registered_fingerprints_cache = []  # Loaded at startup, updated on notifications
 cache_lock = threading.Lock()  # Thread-safe access to caches
 
+# Processing pause control (used during fingerprint enrollment)
+processing_pause_event = threading.Event()
+
+
+def pause_main_processing(reason=""):
+    """Pause RTSP processing loops while fingerprint enrollment runs."""
+    if not processing_pause_event.is_set():
+        message = "⏸️ Pausing main processing"
+        if reason:
+            message += f" ({reason})"
+        print(message)
+        processing_pause_event.set()
+
+
+def resume_main_processing():
+    """Resume RTSP processing loops after enrollment completes."""
+    if processing_pause_event.is_set():
+        processing_pause_event.clear()
+        print("▶️ Resuming main processing")
+
 class BiometricCache:
     """Manages in-memory cache for face embeddings and fingerprint features"""
     
@@ -630,7 +650,7 @@ def ps3camLoad():
     # Initialize
     print("Initializing camera...")
     if lib.ps3eye_init() == 0:
-        print("❌ No camera found!")
+        print("❌ No usb camera found!")
         sys.exit(1)
     print("✓ Camera detected")
 
@@ -642,6 +662,77 @@ def ps3camLoad():
     lib.ps3eye_set_exposure(200)
 
     return lib 
+
+class AsyncRTSPReader:
+    """Asynchronously pulls frames from an RTSP stream using a background thread."""
+
+    def __init__(self, name, open_fn, reconnect_delay=0.5):
+        self.name = name
+        self.open_fn = open_fn
+        self.reconnect_delay = reconnect_delay
+        self.cap = None
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+
+    def _reader_loop(self):
+        while self.running:
+            if self.cap is None or not self.cap.isOpened():
+                self.cap = self.open_fn()
+                if self.cap is None or not self.cap.isOpened():
+                    time.sleep(self.reconnect_delay)
+                    continue
+                try:
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                try:
+                    if self.cap is not None:
+                        self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+                time.sleep(self.reconnect_delay)
+                continue
+
+            with self.frame_lock:
+                self.latest_frame = frame.copy()
+
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+    def read(self):
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame.copy()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
 
 # Global shared cooldown for entrance operations (face and fingerprint)
 # When either system detects a client and performs entrance/exit, both systems respect the cooldown
@@ -695,6 +786,9 @@ def on_entrance_fingerprint(client_id, client_name, confidence):
     if client_info['locker'] is None:
         # ENTRY - assign locker
         print(f"🚪 ENTRY detected for {client_name}")
+        send_str = f"ENTRY detected for {client_name}"
+        sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+        sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
         
         # Check membership and sessions
         membership_info = db.check_membership_sessions(client_id)
@@ -761,6 +855,11 @@ def on_entrance_fingerprint(client_id, client_name, confidence):
             print(f"   Sessions remaining: {summary['sessions']}")
         
         print(f"👋 EXIT: {client_name} left gym")
+        send_str = f"EXIT: {client_name} left gym"
+        sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+        sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+        send_str = f"OPEN"
+        sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
         
         # Update shared cooldown (face and fingerprint systems share this)
         update_entrance_cooldown(client_id)
@@ -774,7 +873,7 @@ def on_locker_fingerprint(client_id, client_name, confidence):
         client_name: Client name (None if no match)
         confidence: Match confidence score (0-1)
     """
-    global sock, raspi_ip, raspi_port, esp32_1_ip, esp32_1_port, esp32_2_ip, esp32_2_port
+    global sock, raspi_locker_ip, raspi_locker_port, esp32_1_ip, esp32_1_port, esp32_2_ip, esp32_2_port, pc_ip, pc_port
     global last_locker_unlock, locker_unlock_cooldown
     
     if client_id is None:
@@ -817,7 +916,9 @@ def on_locker_fingerprint(client_id, client_name, confidence):
             print(f"📤 Unlock command sent to ESP32-2")
         
         # Also send to Raspberry Pi
-        sock.sendto(str(locker_number).encode("utf-8"), (raspi_ip, raspi_port))
+        sock.sendto(str(locker_number).encode("utf-8"), (raspi_locker_ip, raspi_locker_port))
+        send_str = "Locker " + str(locker_number) + " unlocked"
+        sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
         
         # Update last unlock time
         last_locker_unlock[locker_number] = current_time
@@ -864,20 +965,34 @@ if __name__ == '__main__':
     cap = None
     rknn = None
     rknnFace = None
+    entrance_reader = None
+    locker_reader = None
     esp32_1_ip = "192.168.1.201"
     esp32_1_port = 4210
     esp32_2_ip = "192.168.1.202"
     esp32_2_port = 4210
-    raspi_ip = "192.168.1.110"
-    raspi_port = 4210
-    espcam_ip = "192.168.1.111"
+    raspi_locker_ip = "192.168.1.110"
+    raspi_locker_port = 4210
+    raspi_entrance_ip = "192.168.1.111"
+    raspi_entrance_port = 4210
+    espcam_ip = "192.168.1.120"
     espcam_port = 4210
-
+    pc_ip = args.db_host
+    pc_port = 4211
+    ENTRANCE_ESP_IP = "192.168.1.120"  # Entrance/enrollment ESP32
+    ENTRANCE_ESP_PORT = 4210
+    LOCKER_ESP_IP = "192.168.1.121"    # Locker ESP32
+    LOCKER_ESP_PORT = 4210
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         fingerprint_system = DualESP32FingerprintSystem(
-            db, on_entrance_fingerprint, on_locker_fingerprint, sock
+            db,
+            on_entrance_fingerprint,
+            on_locker_fingerprint,
+            sock,
+            pause_callback=lambda: pause_main_processing("fingerprint enrollment"),
+            resume_callback=resume_main_processing
         )
         # Note: fingerprint_cache will be set after biometric_cache is initialized
         
@@ -1030,6 +1145,9 @@ if __name__ == '__main__':
             if current_locker is None:
                 # ===== ENTRY: Check sessions and assign locker =====
                 print(f"🚪 ENTRY detected for {client_name}")
+                send_str = f"ENTRY detected for {client_name}"
+                sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+                sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
                 
                 # 1. Check membership and remaining sessions
                 membership_info = db.check_membership_sessions(client_id)
@@ -1124,23 +1242,46 @@ if __name__ == '__main__':
                 update_entrance_cooldown(client_id)
                 return True               
         # GStreamer pipeline for low-latency RTSP
-        camrstp = "rtsp://192.168.1.111:554/"
+        camrstp = "rtsp://192.168.1.110:8554/live"
+        entrance_camrstp = "rtsp://192.168.1.111:8554/live"
 
-        def open_stream():
+        def open_entrance_stream():
             try:
+                # gst_pipeline = (
+                # f"rtspsrc location={entrance_camrstp} latency=150 ! "
+                # "rtph264depay ! h264parse ! mppvideodec ! "
+                # # "videoflip method=rotate-180 ! "              # Rotation
+                # "videobalance brightness=0.2 ! "              # Brightness (change 0.2)
+                # "videoconvert ! video/x-raw,format=BGR ! "
+                # "appsink max-buffers=1 drop=true"
+                # )
+                # gst_pipeline = (
+                #     f"rtspsrc location={entrance_camrstp} latency=150 protocols=udp udp-reconnect=1 drop-on-late=true timeout=5000000 ! "
+                #     "rtpjitterbuffer latency=0 drop-on-late=true do-lost=true ! "
+                #     "rtph264depay ! h264parse ! "
+                #     "queue max-size-buffers=1 leaky=downstream ! "
+                #     "mppvideodec ! "
+                #     # "videoflip method=rotate-180 ! "
+                #     "videobalance brightness=0.2 ! "
+                #     "videoconvert ! video/x-raw,format=BGR ! "
+                #     "appsink max-buffers=1 drop=true sync=false"
+                # )
+
                 gst_pipeline = (
-                f"rtspsrc location={camrstp} latency=150 ! "
-                "rtph264depay ! h264parse ! mppvideodec ! "
-                "videoflip method=rotate-180 ! "              # Rotation
-                "videobalance brightness=0.2 ! "              # Brightness (change 0.2)
-                "videoconvert ! video/x-raw,format=BGR ! "
-                "appsink max-buffers=1 drop=true"
+                    f"rtspsrc location={entrance_camrstp} latency=150 protocols=udp udp-reconnect=1 drop-on-late=true timeout=5000000 ! "
+                    "rtpjitterbuffer latency=0 drop-on-late=true do-lost=true ! "
+                    "rtph264depay ! h264parse ! "
+                    "queue max-size-buffers=1 leaky=downstream ! "
+                    "avdec_h264 skip-frame=1 ! "
+                    "videobalance brightness=0.2 ! "
+                    "videoconvert ! video/x-raw,format=BGR ! "
+                    "appsink max-buffers=1 drop=true sync=false"
                 )
-                # cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-                cap = cv2.VideoCapture(0)
-                if cap.isOpened():
-                    print("✅ SUCCESS! Pipeline 1 works!")
-                    return cap
+                Entrance_cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+                # cap = cv2.VideoCapture(0)
+                if Entrance_cap.isOpened():
+                    print("✅ SUCCESS! Pipeline entrance works!")
+                    return Entrance_cap
                 else:
                     print("❌ Failed")
                 #     cap = cv2.VideoCapture(camrstp)
@@ -1150,28 +1291,82 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f"Error opening stream: {e}")
                 return None
-                
-        cap = open_stream()
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        retry_count = 0
-        max_retries = 15
-        consecutive_errors = 0
-        max_consecutive_errors = 5
+        
+        def open_stream():
+            try:
+                # locker_gst_pipeline = (
+                # f"rtspsrc location={camrstp} latency=250 ! "
+                # "rtph264depay ! h264parse ! mppvideodec ! "
+                # # "videoflip method=rotate-180 ! "              # Rotation
+                # "videobalance brightness=0.2 ! "              # Brightness (change 0.2) 
+                # "videoconvert ! video/x-raw,format=BGR ! "
+                # "appsink max-buffers=1 drop=true"
+                # )
+                # locker_gst_pipeline = (
+                #     f"rtspsrc location={camrstp} latency=250 protocols=udp udp-reconnect=1 drop-on-late=true timeout=5000000 ! "
+                #     "rtpjitterbuffer latency=0 drop-on-late=true do-lost=true ! "
+                #     "rtph264depay ! h264parse ! "
+                #     "queue max-size-buffers=1 leaky=downstream ! "
+                #     "mppvideodec ! "
+                #     # "videoflip method=rotate-180 ! "
+                #     "videobalance brightness=0.2 ! "
+                #     "videoconvert ! video/x-raw,format=BGR ! "
+                #     "appsink max-buffers=1 drop=true sync=false"
+                # )
+                locker_gst_pipeline = (
+                    f"rtspsrc location={camrstp} latency=250 protocols=udp udp-reconnect=1 drop-on-late=true timeout=5000000 ! "
+                    "rtpjitterbuffer latency=40 drop-on-late=true do-lost=true ! "
+                    "rtph264depay ! h264parse ! "
+                    "queue max-size-buffers=1 leaky=downstream ! "
+                    "avdec_h264 skip-frame=3 ! "
+                    "videobalance brightness=0.2 ! "
+                    "videoconvert ! video/x-raw,format=BGR ! "
+                    "appsink max-buffers=1 drop=true sync=false"
+                )
+                # locker_gst_pipeline = (
+                #     f"rtspsrc location={camrstp} latency=150 protocols=udp udp-reconnect=1 drop-on-late=true timeout=5000000 ! "
+                #     "rtpjitterbuffer latency=40 drop-on-late=true do-lost=true ! "
+                #     "rtph264depay ! h264parse ! "
+                #     "queue max-size-buffers=1 leaky=downstream ! "
+                #     "mppvideodec fast-mode=true discard-corrupted-frames=true ! "
+                #     "videobalance brightness=0.2 ! videoconvert ! "
+                #     "appsink max-buffers=1 drop=true sync=false"
+                # )
+                cap = cv2.VideoCapture(locker_gst_pipeline, cv2.CAP_GSTREAMER)
+                # cap = cv2.VideoCapture(0)
+                if cap.isOpened():
+                    print("✅ SUCCESS! Pipeline 1 works!")
+                    return cap
+                else:
+                    print("❌ open locker stream Failed")
+                #     cap = cv2.VideoCapture(camrstp)
+                #     cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
+                #   return cap
+                    return None
+            except Exception as e:
+                print(f"Error opening stream: {e}")
+                return None
+
+        entrance_reader = AsyncRTSPReader("Entrance", open_entrance_stream)
+        locker_reader = AsyncRTSPReader("Locker", open_stream)
+        entrance_reader.start()
+        locker_reader.start()
 
 
         # Set up USB camera for locker assignment
-        print("📷 Initializing USB camera...")
-        buffer_size = 640 * 480 * 3
-        buffer = (c_ubyte * buffer_size)()
+        # print("📷 Initializing USB camera...")
+        # buffer_size = 640 * 480 * 3
+        # buffer = (c_ubyte * buffer_size)()
 
-        ps3Cap = ps3camLoad()
+        # ps3Cap = ps3camLoad()
         img_width = 640
         img_height = 480
         model_height, model_width = (320, 320)
         Face_model_height, Face_model_width = (112, 112)
         print("🎬 Starting main recognition loop...")
         print("=" * 60)
+        send_str = "Starting main recognition loop..."
+        sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
         
         def process_locker_camera_frame(frame):
             if frame is None:
@@ -1297,7 +1492,7 @@ if __name__ == '__main__':
                                     best_similarity = sim
                                     best_match = registered_face
                             
-                            if best_similarity > 0.6:  # Adjust threshold as needed
+                            if  best_similarity > 0.6:  # Adjust threshold as needed best_match and
                                 client_id = best_match['client_id']
                                 client_name = best_match['name']
                                 
@@ -1321,8 +1516,10 @@ if __name__ == '__main__':
                                             continue  # Skip this iteration
                                     
                                     # Cooldown passed or first unlock - proceed
-                                    locker_numbers = locker_number 
-                                    sock.sendto(str(locker_number).encode("utf-8"), (raspi_ip, raspi_port))
+                                    locker_numbers = locker_number
+                                    send_str = "Locker " + str(locker_numbers) + " unlocked"
+                                    sock.sendto(str(locker_numbers).encode("utf-8"), (raspi_locker_ip, raspi_locker_port))
+                                    sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
                                     if locker_numbers > 0 and locker_numbers < 25:
                                         sock.sendto(str(locker_numbers).encode("utf-8"), (esp32_1_ip, esp32_1_port))
                                     elif locker_numbers > 25 and locker_numbers < 61:
@@ -1459,8 +1656,8 @@ if __name__ == '__main__':
                                 if sim > best_similarity:
                                     best_similarity = sim
                                     best_match = registered_face
-                            print(f"sim", best_similarity,best_match['name'])
-                            if best_similarity > 0.60:  # Slightly higher threshold for assignment
+                            print(f"sim", best_similarity, best_match['name'] if best_match else "No match")
+                            if  best_similarity > 0.60:  # Slightly higher threshold for assignment best_match and
                                 client_id = best_match['client_id']
                                 client_name = best_match['name']
                                 
@@ -1520,34 +1717,60 @@ if __name__ == '__main__':
         last_locker_unlock = {}  # Track last unlock time per locker
         locker_unlock_cooldown = 10  # seconds between unlocks for same locker
         frame_count = 0
-        while cv2.waitKey(1) < 0:
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        locker_cam = None
+        usb_img = None
+
+        while True:
             try:
                 frame_count += 1
-            
-                if ps3Cap.ps3eye_get_frame(buffer) == 0:
-                    print("Failed to get frame")
-                    break
-                # Convert to numpy array
-                frame = np.frombuffer(buffer, dtype=np.uint8)
-                frame = frame.reshape((480, 640, 3))
 
-                usb_img = process_usb_camera_frame(frame)
-
-                ret, img = cap.read()
-                if not ret or img is None:
-                    print("⚠️ Stream broken. Reconnecting...")
-                    if cap is not None:
-                        cap.release()
-                    time.sleep(0.5)
-                    cap = open_stream()
-                    retry_count += 1
-                    if retry_count > 15:
-                        print("Too many retries, resetting camera/system...")
-                        break
+                if processing_pause_event.is_set():
+                    if not HEADLESS:
+                        key = cv2.waitKey(10) & 0xFF
+                        if key == ord('q'):
+                            print("Exit requested by user.")
+                            break
+                    time.sleep(0.05)
                     continue
-                retry_count = 0
-                locker_cam = process_locker_camera_frame(img)
-            
+
+                entrance_frame = entrance_reader.read() if entrance_reader else None
+                locker_frame = locker_reader.read() if locker_reader else None
+
+                if entrance_frame is not None:
+                    usb_img = process_usb_camera_frame(entrance_frame)
+                else:
+                    usb_img = None
+
+                if locker_frame is not None:
+                    locker_cam = process_locker_camera_frame(locker_frame)
+                else:
+                    locker_cam = None
+
+                # If both frames are unavailable, wait briefly to avoid a busy loop
+                if entrance_frame is None and locker_frame is None:
+                    time.sleep(0.05)
+                    continue
+
+                consecutive_errors = 0
+
+                if not HEADLESS:
+                    if locker_cam is not None:
+                        cv2.namedWindow("locker_cam CAM", cv2.WINDOW_FULLSCREEN)
+                        cv2.imshow("locker_cam CAM", locker_cam)
+                    if usb_img is not None:
+                        cv2.namedWindow("USB CAM", cv2.WINDOW_FULLSCREEN)
+                        cv2.imshow("USB CAM", usb_img)
+
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        print("Exit requested by user.")
+                        break
+                else:
+                    # Headless mode: small sleep to yield CPU
+                    time.sleep(0.01)
+
             except KeyboardInterrupt:
                 print("\nInterrupted by user")
                 break
@@ -1560,16 +1783,6 @@ if __name__ == '__main__':
                     break
                 time.sleep(0.1)
                 continue
-        
-            try:
-                if not HEADLESS:
-                    cv2.namedWindow("locker_cam CAM", cv2.WINDOW_FULLSCREEN)
-                    cv2.imshow("locker_cam CAM", locker_cam)
-                    cv2.namedWindow("USB CAM", cv2.WINDOW_FULLSCREEN)
-                    cv2.imshow("USB CAM", usb_img)
-            
-            except Exception as e:
-                print(f"Display error: {e}")
     # cv2.imwrite(img_path, img)
     # print("save image in", img_path)
     except Exception as e:
@@ -1592,10 +1805,15 @@ if __name__ == '__main__':
                 rknnFace.release()
             except:
                 pass
-        if cap is not None:
+        if locker_reader is not None:
             try:
-                cap.release()
-            except:
+                locker_reader.stop()
+            except Exception:
+                pass
+        if entrance_reader is not None:
+            try:
+                entrance_reader.stop()
+            except Exception:
                 pass
         if sock is not None:
             try:

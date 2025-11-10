@@ -10,7 +10,18 @@ import time
 import os
 import pickle
 import cv2
+import socket
 
+
+pc_ip = "192.168.1.3"
+pc_port = 4211
+ENTRANCE_ESP_IP = "192.168.1.120"  # Entrance/enrollment ESP32
+ENTRANCE_ESP_PORT = 4210
+LOCKER_ESP_IP = "192.168.1.121"    # Locker ESP32
+LOCKER_ESP_PORT = 4210
+raspi_entrance_ip = "192.168.1.111"
+raspi_entrance_port = 4210
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 class DatabaseHelper:
     def __init__(self, host, database, user, password, port=5432, mount_point="/mnt/winshare"):
         """Initialize database connection pool"""
@@ -495,6 +506,9 @@ class DatabaseHelper:
             
             if existing:
                 print(f"⚠️  Locker {locker_number} is already assigned to client {existing[0]} ({existing[1]} {existing[2]})")
+                send_str = f"⚠️  Locker {locker_number} is already assigned to client {existing[0]} ({existing[1]} {existing[2]})"
+                sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+                # sock.sendto(send_str.encode("utf-8"), (ENTRANCE_ESP_IP, ENTRANCE_ESP_PORT))
                 # Optionally, you could unassign it first
                 # cursor.execute("UPDATE clients SET locker = NULL WHERE id = %s", (existing[0],))
             
@@ -518,6 +532,10 @@ class DatabaseHelper:
             
             if rows_affected > 0:
                 print(f"✅ Locker {locker_number} assigned to client {client_id}")
+                send_str = f"Locker {locker_number} assigned to client {client_id}"
+                sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+                send_str = f"OPEN"
+                sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
                 return True
             else:
                 print(f"⚠️  No rows updated")
@@ -624,6 +642,9 @@ class DatabaseHelper:
             
             if not result:
                 print(f"❌ No active membership to decrease sessions")
+                send_str = f"No active membership to decrease sessions"
+                sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+                sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
                 cursor.close()
                 return False
             
@@ -651,6 +672,9 @@ class DatabaseHelper:
             
             print(f"✅ Session decreased for {fname} {lname}")
             print(f"   Previous: {current_sessions} → New: {new_session_count}")
+            send_str = f"   Previous: {current_sessions} => New: {new_session_count}"
+            sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+            sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
             
             # Check if sessions exhausted
             if new_session_count == 0:
@@ -919,6 +943,11 @@ class DatabaseHelper:
             
             if rows_affected > 0:
                 print(f"✅ Locker {previous_locker} unassigned from client {client_id}")
+                send_str = f"Locker {previous_locker+1} unassigned from client {client_id}"
+                sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+                sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+                send_str = f"OPEN"
+                sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
                 return True
             else:
                 print(f"⚠️  No rows updated for client {client_id}")
@@ -1411,6 +1440,11 @@ class DatabaseHelper:
                 return []
             
             cursor = connection.cursor()
+            # Increase statement timeout for heavy fingerprint payloads (default is 3s)
+            try:
+                cursor.execute("SET LOCAL statement_timeout = %s", (15000,))  # 15 seconds
+            except Exception as timeout_err:
+                print(f"⚠️ Unable to adjust statement_timeout: {timeout_err}")
             
             query = """
                 SELECT finger_index, sample_number, descriptors, keypoints_data, num_features, confidence
@@ -1462,6 +1496,10 @@ class DatabaseHelper:
             return []
         finally:
             if connection:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
                 self.return_connection(connection)
 
     def get_all_fingerprint_features(self):
@@ -1513,6 +1551,34 @@ class DatabaseHelper:
         finally:
             if connection:
                 self.return_connection(connection)
+
+    def get_fingerprint_profile(self, client_id):
+        """
+        Retrieve fingerprint data for a single client in the same structure
+        used by get_all_fingerprint_features.
+        """
+        try:
+            client_info = self.get_client_info(client_id)
+            if not client_info:
+                return None
+
+            fingers = self.get_fingerprint_features(client_id)
+            if not fingers:
+                return None
+
+            flat_samples = []
+            for finger in fingers:
+                flat_samples.extend(finger.get('samples', []))
+
+            return {
+                'client_id': client_id,
+                'name': f"{client_info['fname']} {client_info['lname']}",
+                'fingers': fingers,
+                'fingerprints': flat_samples
+            }
+        except Exception as e:
+            print(f"❌ Error retrieving fingerprint profile for client {client_id}: {e}")
+            return None
 
     def check_fingerprint_exists(self, client_id):
         """Check if fingerprint features exist for a client"""

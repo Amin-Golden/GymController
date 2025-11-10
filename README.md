@@ -1,3 +1,20 @@
+PC = 192.168.1.3
+pc_port = 4211
+orangepi = 192.168.1.100
+espcam_locker_ip = 192.168.1.110
+espcam_locke_port = 4210
+esp32_1_ip = "192.168.1.201"
+esp32_1_port = 4210
+esp32_2_ip = "192.168.1.202"
+esp32_2_port = 4210
+espcam_ip = "192.168.1.111"
+espcam_port = 4210
+finger_enter_esp = 192, 168, 1, 120
+UDP_PORT_ENTRANCE = 8889  # Port for entrance ESP32 
+finger_locker_esp192, 168, 1, 121
+UDP_PORT_LOCKER = 8890    # Port for locker ESP32 
+
+
 gst-launch-1.0 rtspsrc location=rtsp://192.168.1.110:8554/live latency=100 ! rtph264depay ! h264parse ! mppvideodec ! autovideosink
 
 On PC :
