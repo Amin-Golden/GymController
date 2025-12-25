@@ -25,7 +25,7 @@ END_MARKER = b"FPIMGEND"
 # Fingerprint matching parameters
 FINGERS_PER_CLIENT = 2
 SAMPLES_PER_FINGER = 5
-MATCH_THRESHOLD = 0.10  # Adjusted for realistic SIFT/ORB matching
+MATCH_THRESHOLD = 0.12  # Adjusted for realistic SIFT/ORB matching
 
 # ESP32 endpoints for feedback
 ENTRANCE_ESP_IP = "192.168.1.120"  # Entrance/enrollment ESP32
@@ -245,6 +245,8 @@ class DualESP32FingerprintSystem:
         self.locker_thread = None
         self.entrance_running = False
         self.locker_running = False
+        self.enrollment_lock = threading.RLock()
+        self.enrollment_active = threading.Event()
         
         print("✅ Dual ESP32 fingerprint system initialized")
     
@@ -306,6 +308,56 @@ class DualESP32FingerprintSystem:
         )
         self.locker_thread.start()
         print(f"🔐 Locker listener started (Port {UDP_PORT_LOCKER})")
+
+    def is_enrollment_in_progress(self):
+        """Return True if a fingerprint enrollment flow is currently running."""
+        return self.enrollment_active.is_set()
+
+    def perform_enrollment(self, client_id, finger_index=None, use_entrance_esp=True):
+        """
+        Unified enrollment entry point that serializes access and pauses auto identification.
+        Args:
+            client_id: Target client id
+            finger_index: Optional finger index (1 or 2). If None, enroll both fingers.
+            use_entrance_esp: Whether to use the entrance ESP32 (default True)
+        """
+        if client_id is None:
+            print("❌ perform_enrollment called without a valid client_id")
+            return False
+
+        result = False
+        with self.enrollment_lock:
+            if self.enrollment_active.is_set():
+                print(f"⏳ Enrollment already in progress; waiting to process client {client_id}")
+            self.enrollment_active.set()
+            try:
+                if finger_index is None:
+                    result = self.enroll_client_fingerprint(client_id, use_entrance_esp=use_entrance_esp)
+                else:
+                    pause_acquired = self._request_pause(f"fingerprint enrollment - finger {finger_index}")
+                    was_entrance_running = self.entrance_running
+                    was_locker_running = self.locker_running
+                    if was_entrance_running:
+                        self.stop_entrance_listener()
+                    if was_locker_running:
+                        self.stop_locker_listener()
+                    try:
+                        result = self.enroll_client_single_finger(
+                            client_id,
+                            finger_index,
+                            use_entrance_esp=use_entrance_esp,
+                            manage_pause=False
+                        )
+                    finally:
+                        if was_entrance_running:
+                            self.start_entrance_listener()
+                        if was_locker_running:
+                            self.start_locker_listener()
+                        if pause_acquired:
+                            self._release_pause()
+            finally:
+                self.enrollment_active.clear()
+        return result
     
     def stop_entrance_listener(self):
         """Stop entrance listener"""
@@ -504,31 +556,41 @@ class DualESP32FingerprintSystem:
         Returns:
             True if successful
         """
-        pause_acquired = self._request_pause("fingerprint enrollment")
+        with self.enrollment_lock:
+            owns_event = False
+            if not self.enrollment_active.is_set():
+                self.enrollment_active.set()
+                owns_event = True
+            else:
+                print("ℹ️  Reusing existing enrollment session context")
 
-        # Pause listeners during enrollment
-        was_entrance_running = self.entrance_running
-        was_locker_running = self.locker_running
-        
-        if was_entrance_running:
-            self.stop_entrance_listener()
-        if was_locker_running:
-            self.stop_locker_listener()
-        
-        try:
-            success = self.enroll_client_two_fingers(client_id, use_entrance_esp)
-        finally:
-            # Resume listeners
+            pause_acquired = self._request_pause("fingerprint enrollment")
+
+            # Pause listeners during enrollment
+            was_entrance_running = self.entrance_running
+            was_locker_running = self.locker_running
+            
             if was_entrance_running:
-                self.start_entrance_listener()
+                self.stop_entrance_listener()
             if was_locker_running:
-                self.start_locker_listener()
-            if pause_acquired:
-                self._release_pause()
-        
-        return success
+                self.stop_locker_listener()
+            
+            try:
+                success = self.enroll_client_two_fingers(client_id, use_entrance_esp)
+            finally:
+                # Resume listeners
+                if was_entrance_running:
+                    self.start_entrance_listener()
+                if was_locker_running:
+                    self.start_locker_listener()
+                if pause_acquired:
+                    self._release_pause()
+                if owns_event:
+                    self.enrollment_active.clear()
+            
+            return success
     
-    def enroll_client_single_finger(self, client_id, finger_index=1, use_entrance_esp=True):
+    def enroll_client_single_finger(self, client_id, finger_index=1, use_entrance_esp=True, manage_pause=True):
         """
         Enroll 5 fingerprint samples for a specific finger (1 or 2)
         
@@ -536,11 +598,14 @@ class DualESP32FingerprintSystem:
             client_id: Client ID to enroll
             finger_index: 1 or 2 (which finger)
             use_entrance_esp: If True, use entrance ESP32, else use locker ESP32
+            manage_pause: When True, pause/resume the main pipeline within this call.
         
         Returns:
             True if successful
         """
-        single_pause = self._request_pause(f"fingerprint enrollment - finger {finger_index}")
+        single_pause = False
+        if manage_pause:
+            single_pause = self._request_pause(f"fingerprint enrollment - finger {finger_index}")
         try:
             print(f"\n{'='*60}")
             print(f"🖐️ FINGERPRINT ENROLLMENT - Client ID: {client_id} - Finger {finger_index}")
@@ -660,7 +725,7 @@ class DualESP32FingerprintSystem:
             
             return success
         finally:
-            if single_pause:
+            if manage_pause and single_pause:
                 self._release_pause()
     
     def enroll_client_two_fingers(self, client_id, use_entrance_esp=True):

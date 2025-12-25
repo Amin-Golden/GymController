@@ -450,12 +450,13 @@ def safe_extract_face(img, coords):
 class FaceEnrollmentProcessor:
     """Handles automatic face enrollment when new members are added"""
     
-    def __init__(self, db_helper, rknn_face, face_model_size=(112, 112), biometric_cache=None, fingerprint_system=None):
+    def __init__(self, db_helper, rknn_face, face_model_size=(112, 112), biometric_cache=None, fingerprint_system=None, fingerprint_enrollment_processor=None):
         self.db = db_helper
         self.rknn_face = rknn_face
         self.face_model_size = face_model_size
         self.biometric_cache = biometric_cache
         self.fingerprint_system = fingerprint_system
+        self.fingerprint_enrollment_processor = fingerprint_enrollment_processor
         self.processing_queue = Queue()
         self.is_running = True
         
@@ -572,47 +573,6 @@ class FaceEnrollmentProcessor:
                         if self.biometric_cache:
                             self.biometric_cache.update_client_face(client_id)
                             registered_faces_cache[:] = self.biometric_cache.get_faces()
-                        # Trigger fingerprint enrollment asynchronously after face embedding
-                        try:
-                            if self.fingerprint_system:
-                                def _enroll_fingerprint_bg():
-                                    try:
-                                        # Pause listeners to avoid interference
-                                        was_entrance_running = self.fingerprint_system.entrance_running
-                                        was_locker_running = self.fingerprint_system.locker_running
-                                        if was_entrance_running:
-                                            self.fingerprint_system.stop_entrance_listener()
-                                        if was_locker_running:
-                                            self.fingerprint_system.stop_locker_listener()
-                                        # Name for logs
-                                        display_name = name if name else f"Client {client_id}"
-                                        print(f"🖐️ Auto-enrolling fingerprint for {display_name} (after face update)")
-                                        # Use entrance ESP32 for enrollment
-                                        success_fp = self.fingerprint_system.enroll_client_fingerprint(client_id, use_entrance_esp=True)
-                                        if success_fp:
-                                            print(f"✅ Fingerprint enrolled for {display_name}")
-                                            # Update global cache after enrollment
-                                            if self.biometric_cache:
-                                                self.biometric_cache.update_client_fingerprints(client_id)
-                                                global registered_fingerprints_cache
-                                                registered_fingerprints_cache[:] = self.biometric_cache.get_fingerprints()
-                                                print(f"✅ Updated global fingerprint cache")
-                                        else:
-                                            print(f"⚠️ Fingerprint enrollment skipped/failed for {display_name}")
-                                    except Exception as _e:
-                                        print(f"❌ Error during auto fingerprint enrollment: {_e}")
-                                    finally:
-                                        # Resume listeners
-                                        try:
-                                            if 'was_entrance_running' in locals() and was_entrance_running:
-                                                self.fingerprint_system.start_entrance_listener()
-                                            if 'was_locker_running' in locals() and was_locker_running:
-                                                self.fingerprint_system.start_locker_listener()
-                                        except Exception:
-                                            pass
-                                threading.Thread(target=_enroll_fingerprint_bg, daemon=True).start()
-                        except Exception as _e:
-                            print(f"❌ Could not trigger fingerprint enrollment: {_e}")
                     else:
                         print(f"❌ Failed to save embedding for client {client_id}")
                 else:
@@ -626,6 +586,123 @@ class FaceEnrollmentProcessor:
     def stop(self):
         """Stop the processing thread"""
         self.is_running = False
+
+class FingerprintEnrollmentProcessor:
+    """Serializes fingerprint enrollment requests triggered by notifications or face updates."""
+
+    def __init__(self, fingerprint_system, db_helper, biometric_cache=None, sock=None, status_endpoints=None):
+        self.fingerprint_system = fingerprint_system
+        self.db = db_helper
+        self.biometric_cache = biometric_cache
+        self.sock = sock
+        self.status_endpoints = status_endpoints or []
+        self.queue = Queue()
+        self.pending = set()
+        self.lock = threading.Lock()
+        self.running = True
+        self.worker = threading.Thread(target=self._process_queue, daemon=True)
+        self.worker.start()
+
+    def enqueue(self, client_id, finger_index=None, use_entrance_esp=True, source="notification"):
+        """Queue a fingerprint enrollment request."""
+        if client_id is None:
+            print("❌ Fingerprint enrollment request missing client_id")
+            return
+
+        key = (client_id, finger_index, use_entrance_esp)
+        with self.lock:
+            if not self.running:
+                print("⚠️ Fingerprint enrollment processor stopped; ignoring request")
+                return
+            if key in self.pending:
+                finger_label = finger_index if finger_index else "both"
+                print(f"ℹ️ Enrollment already queued for client {client_id} (finger {finger_label})")
+                return
+            self.pending.add(key)
+            self.queue.put({
+                'client_id': client_id,
+                'finger_index': finger_index,
+                'use_entrance_esp': use_entrance_esp,
+                'source': source
+            })
+
+    def stop(self):
+        """Stop worker thread and clear pending requests."""
+        with self.lock:
+            if not self.running:
+                return
+            self.running = False
+        self.queue.put(None)
+        if self.worker:
+            self.worker.join(timeout=2.0)
+        with self.lock:
+            self.pending.clear()
+
+    def _send_status(self, message):
+        if not self.sock or not self.status_endpoints:
+            return
+        for endpoint in self.status_endpoints:
+            try:
+                self.sock.sendto(message.encode("utf-8"), endpoint)
+            except Exception as send_err:
+                print(f"⚠️ Unable to send status message: {send_err}")
+
+    def _fetch_client_name(self, client_id):
+        try:
+            info = self.db.get_client_info(client_id)
+            if info:
+                return f"{info['fname']} {info['lname']}"
+        except Exception as info_err:
+            print(f"⚠️ Could not fetch client info for {client_id}: {info_err}")
+        return None
+
+    def _process_queue(self):
+        while True:
+            request = self.queue.get()
+            if request is None:
+                break
+
+            client_id = request['client_id']
+            finger_index = request.get('finger_index')
+            use_entrance_esp = request.get('use_entrance_esp', True)
+            source = request.get('source', 'notification')
+            key = (client_id, finger_index, use_entrance_esp)
+
+            device_label = "entrance" if use_entrance_esp else "locker"
+            finger_label = f"finger {finger_index}" if finger_index else "both fingers"
+
+            try:
+                display_name = self._fetch_client_name(client_id) or f"Client {client_id}"
+                entry_message = f"🖐️ Fingerprint enrollment requested for {display_name} ({finger_label}, {device_label}) via {source}"
+                print(entry_message)
+                self._send_status(entry_message)
+
+                success = self.fingerprint_system.perform_enrollment(
+                    client_id,
+                    finger_index=finger_index,
+                    use_entrance_esp=use_entrance_esp
+                )
+
+                if success:
+                    success_msg = f"✅ Fingerprint enrollment completed for {display_name}"
+                    print(success_msg)
+                    self._send_status(success_msg)
+                    if self.biometric_cache:
+                        self.biometric_cache.update_client_fingerprints(client_id)
+                        global registered_fingerprints_cache
+                        registered_fingerprints_cache[:] = self.biometric_cache.get_fingerprints()
+                        print("✅ Updated global fingerprint cache")
+                else:
+                    warn_msg = f"⚠️ Fingerprint enrollment failed for {display_name}"
+                    print(warn_msg)
+                    self._send_status(warn_msg)
+            except Exception as e:
+                print(f"❌ Error processing fingerprint enrollment queue: {e}")
+                traceback.print_exc()
+            finally:
+                with self.lock:
+                    self.pending.discard(key)
+        print("🛑 Fingerprint enrollment processor stopped")
 
 def ps3camLoad():
     # Load library
@@ -967,6 +1044,10 @@ if __name__ == '__main__':
     rknnFace = None
     entrance_reader = None
     locker_reader = None
+    fingerprint_system = None
+    fingerprint_enrollment_processor = None
+    enrollment_processor = None
+    fingerprint_notification_handler = None
     esp32_1_ip = "192.168.1.201"
     esp32_1_port = 4210
     esp32_2_ip = "192.168.1.202"
@@ -1038,8 +1119,26 @@ if __name__ == '__main__':
         registered_faces_cache[:] = biometric_cache.get_faces()
         registered_fingerprints_cache[:] = biometric_cache.get_fingerprints()
         
+        status_endpoints = [
+            (pc_ip, pc_port),
+            (raspi_entrance_ip, raspi_entrance_port)
+        ]
+        fingerprint_enrollment_processor = FingerprintEnrollmentProcessor(
+            fingerprint_system,
+            db,
+            biometric_cache=biometric_cache,
+            sock=sock,
+            status_endpoints=status_endpoints
+        )
+        
         # Initialize face enrollment processor (pass cache and fingerprint system)
-        enrollment_processor = FaceEnrollmentProcessor(db, rknnFace, biometric_cache=biometric_cache, fingerprint_system=fingerprint_system)
+        enrollment_processor = FaceEnrollmentProcessor(
+            db,
+            rknnFace,
+            biometric_cache=biometric_cache,
+            fingerprint_system=fingerprint_system,
+            fingerprint_enrollment_processor=fingerprint_enrollment_processor
+        )
         
         # Define callback for database notifications
         def on_client_change(notification):
@@ -1051,6 +1150,8 @@ if __name__ == '__main__':
             print(f"📢 Client {action}: ID={client_id}")
             
             if client_id is None:
+                return
+            if action == 'FINGERPRINT_ENROLL':
                 return
             
             if action == 'DELETE':
@@ -1087,6 +1188,54 @@ if __name__ == '__main__':
                     biometric_cache.update_client_face(client_id)
                     registered_faces_cache[:] = biometric_cache.get_faces()
                     print(f"ℹ️  Face embedding updated in cache for client {client_id}")
+        
+        def handle_fingerprint_enroll(notification):
+            client_id = notification.get('client_id')
+            if client_id is None:
+                print("❌ Fingerprint enrollment notification missing client_id")
+                return
+
+            finger_index = notification.get('finger_index', notification.get('finger'))
+            if finger_index is not None:
+                try:
+                    finger_index = int(finger_index)
+                    if finger_index <= 0:
+                        finger_index = None
+                except (TypeError, ValueError):
+                    print(f"⚠️ Invalid finger index in notification: {finger_index}")
+                    finger_index = None
+
+            use_entrance_esp = True
+            if notification.get('use_entrance_esp') is False:
+                use_entrance_esp = False
+            if notification.get('use_locker_esp') is True:
+                use_entrance_esp = False
+
+            device = notification.get('device') or notification.get('sensor')
+            if device:
+                device_str = str(device).lower()
+                if 'locker' in device_str:
+                    use_entrance_esp = False
+                elif 'entrance' in device_str:
+                    use_entrance_esp = True
+
+            source = notification.get('source', 'db_notification')
+            if fingerprint_enrollment_processor:
+                fingerprint_enrollment_processor.enqueue(
+                    client_id,
+                    finger_index=finger_index,
+                    use_entrance_esp=use_entrance_esp,
+                    source=source
+                )
+            elif fingerprint_system:
+                fingerprint_system.perform_enrollment(
+                    client_id,
+                    finger_index=finger_index,
+                    use_entrance_esp=use_entrance_esp
+                )
+
+        fingerprint_notification_handler = handle_fingerprint_enroll
+        db.register_notification_handler('FINGERPRINT_ENROLL', handle_fingerprint_enroll)
         
         # Update fingerprint system to use cached data
         fingerprint_system.set_fingerprint_cache(biometric_cache)
@@ -1792,6 +1941,16 @@ if __name__ == '__main__':
     finally:
         # Cleanup
         print("\n🛑 Shutting down...")
+        if fingerprint_notification_handler:
+            try:
+                db.unregister_notification_handler('FINGERPRINT_ENROLL', fingerprint_notification_handler)
+            except Exception as unregister_err:
+                print(f"⚠️ Unable to unregister fingerprint handler: {unregister_err}")
+        if fingerprint_enrollment_processor:
+            try:
+                fingerprint_enrollment_processor.stop()
+            except Exception as stop_err:
+                print(f"⚠️ Error stopping fingerprint enrollment processor: {stop_err}")
         db.stop_listening()
         db.close_all_connections()
         if rknn is not None:
@@ -1824,7 +1983,11 @@ if __name__ == '__main__':
             cv2.destroyAllWindows()
         except:
             pass
-        enrollment_processor.stop()        
+        if enrollment_processor:
+            try:
+                enrollment_processor.stop()
+            except Exception:
+                pass        
         # Add fingerprint cleanup
         if  fingerprint_system:
             try:

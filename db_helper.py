@@ -52,6 +52,8 @@ class DatabaseHelper:
             self.listen_connection = None
             self.listening = False
             self.notification_callback = None
+            self._notification_handlers = {}
+            self._notification_handlers_lock = threading.Lock()
             
         except Exception as e:
             print(f"❌ Error creating connection pool: {e}")
@@ -383,12 +385,50 @@ class DatabaseHelper:
                             
                             if self.notification_callback:
                                 self.notification_callback(payload)
+
+                            action = payload.get('action') if isinstance(payload, dict) else None
+                            if action:
+                                with self._notification_handlers_lock:
+                                    handlers = list(self._notification_handlers.get(action, []))
+                                for handler in handlers:
+                                    try:
+                                        handler(payload)
+                                    except Exception as handler_exc:
+                                        print(f"❌ Error in handler for action {action}: {handler_exc}")
+                                        import traceback
+                                        traceback.print_exc()
                         except json.JSONDecodeError as e:
                             print(f"❌ Error parsing notification: {e}")
                             
             except Exception as e:
                 print(f"❌ Error in listen loop: {e}")
                 time.sleep(1)
+
+    def register_notification_handler(self, action, handler):
+        """Register a callable that handles a specific notification action."""
+        if not action or not callable(handler):
+            raise ValueError("Both action and callable handler are required")
+        with self._notification_handlers_lock:
+            handlers = self._notification_handlers.setdefault(action, [])
+            if handler not in handlers:
+                handlers.append(handler)
+
+    def unregister_notification_handler(self, action, handler=None):
+        """Remove a previously registered notification handler."""
+        with self._notification_handlers_lock:
+            if action not in self._notification_handlers:
+                return
+            if handler is None:
+                del self._notification_handlers[action]
+                return
+            handlers = [
+                existing for existing in self._notification_handlers[action]
+                if existing != handler
+            ]
+            if handlers:
+                self._notification_handlers[action] = handlers
+            else:
+                del self._notification_handlers[action]
 
     def stop_listening(self):
         """Stop listening for notifications"""
@@ -1631,3 +1671,4 @@ class DatabaseHelper:
         finally:
             if connection:
                 self.return_connection(connection)
+                
