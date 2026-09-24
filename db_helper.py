@@ -12,6 +12,14 @@ import pickle
 import cv2
 import socket
 
+# Import fingerprint utilities for embedding generation
+try:
+    from fingerprint_utils import aggregate_descriptors_simple
+    FINGERPRINT_UTILS_AVAILABLE = True
+except ImportError:
+    FINGERPRINT_UTILS_AVAILABLE = False
+    print("⚠️  fingerprint_utils not available - embeddings will not be stored")
+
 
 pc_ip = "192.168.1.3"
 pc_port = 4211
@@ -1386,6 +1394,50 @@ class DatabaseHelper:
     # FINGERPRINT METHODS
     # ========================================
 
+    # Optional fingerprint_features columns, looked up once per process.
+    _fingerprint_columns = None
+
+    def get_fingerprint_columns(self):
+        """Which optional columns exist on fingerprint_features.
+
+        Kept in a class level cache: the answer only changes when a migration is
+        run, and probing it per insert would cost a round trip each time.
+        """
+        if DatabaseHelper._fingerprint_columns is not None:
+            return DatabaseHelper._fingerprint_columns
+
+        found = set()
+        connection = None
+        try:
+            connection = self.get_connection_with_timeout(timeout=3.0)
+            if connection is None:
+                return found  # not cached - retry on the next call
+            cursor = connection.cursor()
+            cursor.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'fingerprint_features'
+                  AND column_name IN ('embedding', 'xyt_template', 'image_path',
+                                      'minutiae_count', 'nbis_updated_at')
+            """)
+            found = {row[0] for row in cursor.fetchall()}
+            cursor.close()
+            DatabaseHelper._fingerprint_columns = found
+
+            missing = {'xyt_template', 'image_path'} - found
+            if missing:
+                print(f"⚠️  fingerprint_features is missing {sorted(missing)} - "
+                      "run migrate_fingerprint_nbis.sql to enable the NBIS engine")
+        except Exception as e:
+            print(f"⚠️  Could not inspect fingerprint_features columns: {e}")
+        finally:
+            if connection:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                self.return_connection(connection)
+        return found
+
     def save_fingerprint_features(self, client_id, finger_index, features_list):
         """
         Save fingerprint feature samples for a specific finger (1 or 2)
@@ -1414,42 +1466,80 @@ class DatabaseHelper:
             # Delete existing fingerprints for this client and finger_index
             cursor.execute("DELETE FROM fingerprint_features WHERE client_id = %s AND finger_index = %s", (client_id, finger_index))
             
-            # Insert each sample
+            # Insert each sample. Optional columns (embedding / NBIS template /
+            # raw image path) are only used when the migrations have been run -
+            # see migrate_fingerprint_embeddings.sql and migrate_fingerprint_nbis.sql.
+            optional = self.get_fingerprint_columns()
+
             for idx, features in enumerate(features_list, start=1):
                 if features is None:
                     continue
-                
+
                 descriptors = features.get('descriptors')
                 keypoints = features.get('keypoints', [])
                 num_features = len(descriptors) if descriptors is not None else 0
                 confidence = features.get('confidence', 1.0)
-                
-                if descriptors is None or num_features == 0:
-                    print(f"⚠️  Skipping sample {idx} - no descriptors")
+                xyt = features.get('xyt')
+                image_path = features.get('image_path')
+
+                # A sample is worth keeping if either engine produced something.
+                if num_features == 0 and not xyt:
+                    print(f"⚠️  Skipping sample {idx} - no descriptors and no NBIS template")
                     continue
-                
-                # Convert to binary
-                descriptors_binary = descriptors.tobytes()
+                if num_features == 0 and 'xyt_template' not in optional:
+                    print(f"⚠️  Skipping sample {idx} - only an NBIS template, but the database "
+                          "cannot store it yet (run migrate_fingerprint_nbis.sql)")
+                    continue
+
+                # Convert to binary (SIFT descriptors are float32)
+                descriptors_binary = descriptors.tobytes() if descriptors is not None else b''
                 keypoints_binary = pickle.dumps(keypoints)
-                
-                query = """
-                    INSERT INTO fingerprint_features 
-                    (client_id, finger_index, sample_number, descriptors, keypoints_data, num_features, confidence, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """
-                
-                cursor.execute(query, (
-                    client_id,
-                    finger_index,
-                    idx,
-                    psycopg2.Binary(descriptors_binary),
-                    psycopg2.Binary(keypoints_binary),
-                    num_features,
-                    self.convert_numpy_types(confidence),
-                    datetime.now()
-                ))
-                
-                print(f"✅ Saved fingerprint sample {idx} for client {client_id} ({num_features} features)")
+
+                columns = ['client_id', 'finger_index', 'sample_number', 'descriptors',
+                           'keypoints_data', 'num_features', 'confidence']
+                values = [client_id, finger_index, idx,
+                          psycopg2.Binary(descriptors_binary),
+                          psycopg2.Binary(keypoints_binary),
+                          num_features,
+                          self.convert_numpy_types(confidence)]
+
+                # Legacy SIFT embedding (only meaningful for the old engine)
+                if 'embedding' in optional and FINGERPRINT_UTILS_AVAILABLE and descriptors is not None:
+                    try:
+                        embedding = aggregate_descriptors_simple(descriptors, target_dim=128)
+                        if embedding is not None:
+                            columns.append('embedding')
+                            values.append(psycopg2.Binary(embedding.tobytes()))
+                    except Exception as e:
+                        print(f"⚠️  Could not generate embedding for sample {idx}: {e}")
+
+                # NBIS minutiae template (MINDTCT .xyt text)
+                if xyt and 'xyt_template' in optional:
+                    columns.append('xyt_template')
+                    values.append(xyt)
+                    if 'minutiae_count' in optional:
+                        columns.append('minutiae_count')
+                        values.append(int(features.get('minutiae_count') or 0))
+
+                # Raw image kept on disk so a future engine can be rebuilt
+                if image_path and 'image_path' in optional:
+                    columns.append('image_path')
+                    values.append(str(image_path))
+
+                columns.append('updated_at')
+                values.append(datetime.now())
+
+                placeholders = ', '.join(['%s'] * len(values))
+                query = f"INSERT INTO fingerprint_features ({', '.join(columns)}) VALUES ({placeholders})"
+                cursor.execute(query, tuple(values))
+
+                extras = []
+                if xyt:
+                    extras.append(f"{features.get('minutiae_count') or len(xyt.splitlines())} minutiae")
+                if image_path:
+                    extras.append("image saved")
+                detail = f"{num_features} features" + (", " + ", ".join(extras) if extras else "")
+                print(f"✅ Saved fingerprint sample {idx} for client {client_id} ({detail})")
             
             connection.commit()
             cursor.close()
@@ -1486,8 +1576,14 @@ class DatabaseHelper:
             except Exception as timeout_err:
                 print(f"⚠️ Unable to adjust statement_timeout: {timeout_err}")
             
-            query = """
-                SELECT finger_index, sample_number, descriptors, keypoints_data, num_features, confidence
+            # Only select the optional columns that actually exist, so the
+            # query keeps working before the NBIS migration has been applied.
+            optional = [c for c in ('xyt_template', 'image_path', 'minutiae_count')
+                        if c in self.get_fingerprint_columns()]
+            select_extra = (', ' + ', '.join(optional)) if optional else ''
+
+            query = f"""
+                SELECT finger_index, sample_number, descriptors, keypoints_data, num_features, confidence{select_extra}
                 FROM fingerprint_features
                 WHERE client_id = %s
                 ORDER BY finger_index, sample_number
@@ -1500,13 +1596,16 @@ class DatabaseHelper:
             # Group by finger_index
             grouped = {}
             for row in results:
-                finger_index, sample_num, desc_binary, kp_binary, num_feat, conf = row
+                finger_index, sample_num, desc_binary, kp_binary, num_feat, conf = row[:6]
+                extra = dict(zip(optional, row[6:]))
                 
-                # Convert from binary
-                descriptors = np.frombuffer(desc_binary, dtype=np.float32)
+                # Convert from binary (SIFT descriptors are stored as float32)
+                descriptors = np.frombuffer(desc_binary, dtype=np.float32) if desc_binary else np.empty(0, dtype=np.float32)
                 
                 # Reshape based on descriptor type (SIFT=128D, ORB=32bytes=256bits)
-                if len(descriptors) % 128 == 0:
+                if len(descriptors) == 0:
+                    descriptors = descriptors.reshape(0, 128)
+                elif len(descriptors) % 128 == 0:
                     descriptors = descriptors.reshape(-1, 128)
                 else:
                     descriptors = descriptors.reshape(-1, 32)
@@ -1517,7 +1616,11 @@ class DatabaseHelper:
                     'descriptors': descriptors,
                     'keypoints': keypoints,
                     'num_features': num_feat,
-                    'confidence': conf
+                    'confidence': conf,
+                    # NBIS engine fields (None when the sample predates the migration)
+                    'xyt': extra.get('xyt_template'),
+                    'image_path': extra.get('image_path'),
+                    'minutiae_count': extra.get('minutiae_count'),
                 }
                 grouped.setdefault(finger_index, []).append(sample)
             
@@ -1619,6 +1722,91 @@ class DatabaseHelper:
         except Exception as e:
             print(f"❌ Error retrieving fingerprint profile for client {client_id}: {e}")
             return None
+
+    def update_fingerprint_template(self, client_id, finger_index, sample_number,
+                                    xyt, minutiae_count=None, image_path=None):
+        """Attach an NBIS template (and optionally an image path) to one sample.
+
+        Used by backfill_nbis_templates.py to upgrade existing enrollments
+        without asking members to scan again.
+        """
+        optional = self.get_fingerprint_columns()
+        if 'xyt_template' not in optional:
+            print("❌ fingerprint_features has no xyt_template column - run migrate_fingerprint_nbis.sql")
+            return False
+
+        connection = None
+        try:
+            connection = self.get_connection_with_timeout(timeout=5.0)
+            if connection is None:
+                return False
+
+            assignments = ['xyt_template = %s']
+            values = [xyt]
+            if minutiae_count is not None and 'minutiae_count' in optional:
+                assignments.append('minutiae_count = %s')
+                values.append(int(minutiae_count))
+            if image_path and 'image_path' in optional:
+                assignments.append('image_path = %s')
+                values.append(str(image_path))
+            if 'nbis_updated_at' in optional:
+                assignments.append('nbis_updated_at = %s')
+                values.append(datetime.now())
+
+            values.extend([client_id, finger_index, sample_number])
+            cursor = connection.cursor()
+            cursor.execute(
+                f"""UPDATE fingerprint_features SET {', '.join(assignments)}
+                    WHERE client_id = %s AND finger_index = %s AND sample_number = %s""",
+                tuple(values))
+            updated = cursor.rowcount
+            connection.commit()
+            cursor.close()
+            return updated > 0
+
+        except Exception as e:
+            print(f"❌ Error updating fingerprint template: {e}")
+            if connection:
+                connection.rollback()
+            return False
+        finally:
+            if connection:
+                self.return_connection(connection)
+
+    def get_fingerprint_template_stats(self):
+        """How many enrolled samples have an NBIS template / a stored image."""
+        optional = self.get_fingerprint_columns()
+        if 'xyt_template' not in optional:
+            return {'samples': 0, 'with_template': 0, 'with_image': 0, 'clients': 0}
+
+        connection = None
+        try:
+            connection = self.get_connection_with_timeout(timeout=5.0)
+            if connection is None:
+                return {'samples': 0, 'with_template': 0, 'with_image': 0, 'clients': 0}
+            has_image = 'image_path' in optional
+            cursor = connection.cursor()
+            cursor.execute(f"""
+                SELECT COUNT(*),
+                       COUNT(xyt_template),
+                       {'COUNT(image_path)' if has_image else '0'},
+                       COUNT(DISTINCT client_id)
+                FROM fingerprint_features
+            """)
+            samples, with_template, with_image, clients = cursor.fetchone()
+            cursor.close()
+            return {'samples': samples, 'with_template': with_template,
+                    'with_image': with_image, 'clients': clients}
+        except Exception as e:
+            print(f"❌ Error reading fingerprint template stats: {e}")
+            return {'samples': 0, 'with_template': 0, 'with_image': 0, 'clients': 0}
+        finally:
+            if connection:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                self.return_connection(connection)
 
     def check_fingerprint_exists(self, client_id):
         """Check if fingerprint features exist for a client"""

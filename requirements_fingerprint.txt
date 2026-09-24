@@ -1,0 +1,21 @@
+# Additional requirements for improved fingerprint recognition
+# Install with: pip install -r requirements_fingerprint.txt
+
+# Fast similarity search (required for improved performance)
+faiss-cpu>=1.7.4
+# For GPU acceleration (optional, if you have CUDA):
+# faiss-gpu>=1.7.4
+
+# Machine learning utilities (for PCA optimization)
+scikit-learn>=1.0.0
+
+# Already in your project, but listed for reference:
+# numpy>=1.19.0
+# opencv-python>=4.5.0
+# opencv-contrib-python>=4.5.0  # For SIFT support
+
+
+# NBIS (MINDTCT + BOZORTH3) is NOT a pip package - it is a pair of native
+# executables from NIST. See NBIS_SETUP.md for how to install them and point
+# NBIS_BIN_DIR at the bin directory. Nothing else is needed for the NBIS engine;
+# faiss/scikit-learn below are only used by the SIFT fallback engine.

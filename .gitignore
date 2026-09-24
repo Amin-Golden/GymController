@@ -1,3 +1,9 @@
 # Model files (too large for GitHub)
 model/*.rknn
 model/retinafacefp copy.rknn
+
+# Biometric data - never commit fingerprint captures or generated templates
+fingerprint_storage/images/enrolled/
+fingerprint_storage/images/queries/
+fingerprint_storage/nbis_gallery/
+test/r503_captures/

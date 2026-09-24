@@ -12,12 +12,42 @@ import time
 from datetime import datetime
 import threading
 import pickle
+import os
+from fingerprint_processor_improved import ImprovedFingerprintProcessor, FAISS_AVAILABLE
+
+# NBIS engine (MINDTCT + BOZORTH3). Needs native binaries from NIST.
+try:
+    import fingerprint_nbis
+    NBIS_MODULE_AVAILABLE = True
+except Exception as _nbis_import_error:  # noqa: BLE001
+    NBIS_MODULE_AVAILABLE = False
+    print(f"[WARNING] fingerprint_nbis not importable ({_nbis_import_error})")
+
+# Pure-Python minutiae engine. Same interface as fingerprint_nbis but with no
+# native dependencies, so it runs where NBIS cannot be installed (OrangePi 5B).
+try:
+    import fingerprint_local
+    LOCAL_MODULE_AVAILABLE = True
+except Exception as _local_import_error:  # noqa: BLE001
+    LOCAL_MODULE_AVAILABLE = False
+    print(f"[WARNING] fingerprint_local not importable ({_local_import_error})")
+
+# Raw image retention, so the matching algorithm can be changed later without
+# asking every member to enroll again.
+try:
+    import fingerprint_image_store
+    IMAGE_STORE_AVAILABLE = True
+except Exception as _store_import_error:  # noqa: BLE001
+    IMAGE_STORE_AVAILABLE = False
+    print(f"[WARNING] fingerprint_image_store not importable ({_store_import_error}) - images will not be kept")
 
 # Configuration
 UDP_PORT_ENTRANCE = 8889  # Port for entrance ESP32 (enrollment & entry)
 UDP_PORT_LOCKER = 8890    # Port for locker ESP32 (unlock only)
-IMAGE_WIDTH = 64
-IMAGE_HEIGHT = 80
+# Fallback geometry, only used when the image header is missed. R503 sends
+# 192x192; set FINGERPRINT_IMAGE_WIDTH/HEIGHT if your sensor differs.
+IMAGE_WIDTH = int(os.environ.get("FINGERPRINT_IMAGE_WIDTH", "192"))
+IMAGE_HEIGHT = int(os.environ.get("FINGERPRINT_IMAGE_HEIGHT", "192"))
 IMAGE_SIZE = IMAGE_WIDTH * IMAGE_HEIGHT
 EXPECTED_MARKER = b"FPIMG\0\0\0"
 END_MARKER = b"FPIMGEND"
@@ -25,7 +55,39 @@ END_MARKER = b"FPIMGEND"
 # Fingerprint matching parameters
 FINGERS_PER_CLIENT = 2
 SAMPLES_PER_FINGER = 5
-MATCH_THRESHOLD = 0.12  # Adjusted for realistic SIFT/ORB matching
+
+# Which matcher to use:
+#   "auto"  - NBIS if its binaries are installed, else the pure-Python minutiae
+#             engine, else SIFT (default)
+#   "nbis"  - NBIS only (needs mindtct/bozorth3 native binaries)
+#   "local" - pure-Python minutiae engine only (no native dependencies)
+#   "sift"  - the original SIFT/ORB + FAISS engine only
+#
+# SIFT is kept only to read enrollments made before the minutiae migration. It
+# is not a fingerprint algorithm: measured on real captures it scores d' = 1.0
+# and rejects ~75% of genuine members at its own threshold. Do not select it.
+FINGERPRINT_ENGINE = os.environ.get("FINGERPRINT_ENGINE", "auto").lower()
+
+# In "auto" mode, fall back to the SIFT engine when the minutiae engine reports
+# no match. Useful while members enrolled before the migration have no template.
+NBIS_FALLBACK_TO_SIFT = os.environ.get("NBIS_FALLBACK_TO_SIFT", "1") not in ("0", "false", "False")
+
+# Minutiae required to accept an enrollment sample. A weak impression enrolled
+# now can never be matched reliably later, so ask for another press instead.
+# Single source of truth is fingerprint_local.MIN_ENROLL_MINUTIAE - see its
+# comment there for the measurement behind the current value. Falls back to a
+# literal only if that module failed to import.
+MIN_ENROLL_MINUTIAE = int(os.environ.get(
+    "MIN_ENROLL_MINUTIAE",
+    str(fingerprint_local.MIN_ENROLL_MINUTIAE) if LOCAL_MODULE_AVAILABLE else "16"))
+
+# Extra presses allowed while rejecting weak ones, before giving up.
+ENROLL_RETRY_BUDGET = int(os.environ.get("ENROLL_RETRY_BUDGET", "5"))
+
+# SIFT engine threshold. This is a ratio-test match score, NOT a cosine
+# similarity: measured genuine scores sit around 0.04-0.28, so anything above
+# ~0.3 rejects everyone. Only the SIFT path uses it.
+MATCH_THRESHOLD = float(os.environ.get("SIFT_MATCH_THRESHOLD", "0.12"))
 
 # ESP32 endpoints for feedback
 ENTRANCE_ESP_IP = "192.168.1.120"  # Entrance/enrollment ESP32
@@ -36,6 +98,129 @@ pc_ip = "192.168.1.3"            # PC
 pc_port = 4211
 raspi_entrance_ip = "192.168.1.111"
 raspi_entrance_port = 4210
+
+# --------------------------------------------------------------------------
+# NBIS engine access (shared by every fingerprint system instance)
+# --------------------------------------------------------------------------
+
+_engine_module = None
+_engine = None
+_engine_gallery = None
+_engine_checked = False
+_engine_lock = threading.Lock()
+
+
+def get_minutiae_engine():
+    """Return (module, engine, gallery) for the minutiae matcher.
+
+    Both fingerprint_nbis and fingerprint_local expose the same three things -
+    an engine with extract_template(), a GalleryCache and identify() - so the
+    rest of this file does not care which one it got.
+
+    Selection runs once per process, including when it fails: binary discovery
+    and the bozorth3 capability probe are not worth repeating per sensor, and
+    reprinting the failure on every scan only buries the real logs.
+    """
+    global _engine_module, _engine, _engine_gallery, _engine_checked
+
+    if FINGERPRINT_ENGINE == "sift":
+        return (None, None, None)
+
+    with _engine_lock:
+        if _engine_checked:
+            return (_engine_module, _engine, _engine_gallery)
+        _engine_checked = True
+
+        if FINGERPRINT_ENGINE in ("auto", "nbis") and NBIS_MODULE_AVAILABLE:
+            try:
+                engine = fingerprint_nbis.NbisEngine()
+                if engine.available:
+                    _engine_module = fingerprint_nbis
+                    _engine = engine
+                    _engine_gallery = fingerprint_nbis.GalleryCache()
+                    return (_engine_module, _engine, _engine_gallery)
+                if FINGERPRINT_ENGINE == "nbis":
+                    print("[ERROR] FINGERPRINT_ENGINE=nbis but the NBIS binaries are missing - see NBIS_SETUP.md")
+                    return (None, None, None)
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARNING] Could not start the NBIS engine: {e}")
+                if FINGERPRINT_ENGINE == "nbis":
+                    return (None, None, None)
+
+        if FINGERPRINT_ENGINE in ("auto", "local") and LOCAL_MODULE_AVAILABLE:
+            # Messages here stay ASCII: this runs before anything else prints,
+            # and a UnicodeEncodeError on a cp1252 console would otherwise be
+            # caught below and leave the system with no matcher at all.
+            try:
+                engine = fingerprint_local.LocalEngine()
+                _engine_module = fingerprint_local
+                _engine = engine
+                _engine_gallery = fingerprint_local.GalleryCache()
+            except Exception as e:  # noqa: BLE001
+                print(f"[ERROR] Could not start the local engine: {e}")
+            else:
+                if FINGERPRINT_ENGINE == "auto":
+                    print("[INFO] NBIS not installed - using the pure-Python minutiae engine")
+
+    return (_engine_module, _engine, _engine_gallery)
+
+
+# Kept for callers written against the NBIS-only API.
+def get_nbis():
+    module, engine, gallery = get_minutiae_engine()
+    return (engine, gallery)
+
+
+def engine_invalidate_gallery():
+    """Force the enrolled-template gallery to be rebuilt (after an enrollment)."""
+    if _engine_gallery is not None:
+        _engine_gallery.invalidate()
+
+
+# Backwards-compatible alias.
+nbis_invalidate_gallery = engine_invalidate_gallery
+
+
+def build_sample_record(image, processor, client_id=None, finger_index=None, sample_number=None,
+                        nbis_engine=None):
+    """Turn one captured image into a database-ready sample.
+
+    Runs both engines so the stored row serves either matcher, and keeps the raw
+    image on disk so a future algorithm can be rebuilt from it.
+
+    Returns the sample dict, or None when neither engine could use the image.
+    """
+    record = {}
+
+    # 1. Raw image first - it is the only artefact that survives an algorithm change
+    if IMAGE_STORE_AVAILABLE and client_id is not None:
+        path = fingerprint_image_store.save_enrollment_image(image, client_id, finger_index, sample_number)
+        if path:
+            record['image_path'] = path
+
+    # 2. SIFT/ORB descriptors (original engine, still stored)
+    features = processor.extract_features(image)
+    if features:
+        record.update(features)
+
+    # 3. NBIS minutiae template
+    engine = nbis_engine if nbis_engine is not None else get_nbis()[0]
+    if engine is not None:
+        template = engine.extract_template(image)
+        if template:
+            record['xyt'] = template['xyt']
+            record['minutiae_count'] = template['minutiae_count']
+            record['template_quality'] = template['quality']
+
+    # Keep the sample if either engine got something usable out of it
+    if record.get('descriptors') is None and not record.get('xyt'):
+        return None
+
+    record.setdefault('num_features', 0)
+    record.setdefault('confidence', 1.0)
+    record.setdefault('keypoints', [])
+    return record
+
 
 class FingerprintProcessor:
     """Processes fingerprint images and extracts features"""
@@ -161,6 +346,8 @@ class UDPFingerprintReceiver:
         header_received = False
         image_data = bytearray()
         expected_size = IMAGE_SIZE
+        image_width = IMAGE_WIDTH
+        image_height = IMAGE_HEIGHT
         
         while time.time() - start_time < timeout:
             try:
@@ -170,9 +357,11 @@ class UDPFingerprintReceiver:
                 if not header_received and data[:8] == EXPECTED_MARKER:
                     if len(data) >= 20:
                         width, height, size, timestamp = struct.unpack('<HHI I', data[8:20])
-                        print(f"📥 Receiving fingerprint: {width}x{height}, {size} bytes")
+                        image_width = int(width)
+                        image_height = int(height)
+                        print(f"📥 Receiving fingerprint: {image_width}x{image_height}, {size} bytes")
                         header_received = True
-                        expected_size = size
+                        expected_size = int(size)
                     continue
                 
                 # Check for end marker
@@ -181,7 +370,11 @@ class UDPFingerprintReceiver:
                         print(f"✓ Fingerprint received ({len(image_data)} bytes)")
                         # Convert to numpy array
                         img_array = np.frombuffer(image_data, dtype=np.uint8)
-                        img_array = img_array.reshape((IMAGE_HEIGHT, IMAGE_WIDTH))
+                        try:
+                            img_array = img_array.reshape((image_height, image_width))
+                        except Exception:
+                            # Fallback to default constants if reshape fails
+                            img_array = img_array.reshape((IMAGE_HEIGHT, IMAGE_WIDTH))
                         return img_array
                     else:
                         print(f"✗ Size mismatch: got {len(image_data)}, expected {expected_size}")
@@ -217,7 +410,8 @@ class DualESP32FingerprintSystem:
     def __init__(self, db_helper, entrance_callback=None, locker_callback=None,
                  sock=None, fingerprint_cache=None, pause_callback=None, resume_callback=None):
         self.db = db_helper
-        self.processor = FingerprintProcessor()
+        self.processor = ImprovedFingerprintProcessor(embedding_dim=128, use_pca=True)
+        self.nbis_module, self.nbis, self.nbis_gallery = get_minutiae_engine()
         self.sock = sock
         self.fingerprint_cache = fingerprint_cache  # Shared cache from RetinaFaceL
         self.pause_callback = pause_callback
@@ -455,95 +649,146 @@ class DualESP32FingerprintSystem:
                 time.sleep(1)
     
     def _identify_fingerprint(self, image, source="UNKNOWN"):
-        """
-        Identify fingerprint image
-        
-        Returns:
-            Tuple of (client_id, name, confidence) or None
+        """Identify a fingerprint image.
+
+        NBIS (MINDTCT + BOZORTH3) is the primary matcher; the SIFT/FAISS engine
+        is kept as a fallback for members whose enrollment predates the NBIS
+        migration (FINGERPRINT_ENGINE / NBIS_FALLBACK_TO_SIFT control this).
         """
         # Refresh fingerprints from cache if available
         if self.fingerprint_cache:
             self.registered_fingerprints = self.fingerprint_cache.get_fingerprints()
-        
-        # Extract features
+
+        if not self.registered_fingerprints:
+            print(f"⚠️ [{source}] No fingerprints enrolled")
+            self._save_query_image(image, source, "nomatch")
+            return None
+
+        # --- NBIS engine ---------------------------------------------------
+        if self.nbis is not None:
+            result = self._identify_with_nbis(image, source)
+            if result:
+                return result
+            if FINGERPRINT_ENGINE in ("nbis", "local") or not NBIS_FALLBACK_TO_SIFT:
+                self._save_query_image(image, source, "nomatch")
+                return None
+            print(f"↩️  [{source}] Falling back to the SIFT engine")
+        elif FINGERPRINT_ENGINE in ("nbis", "local"):
+            print(f"❌ [{source}] minutiae engine unavailable and fallback disabled")
+            return None
+
+        # --- SIFT/FAISS engine (original) ----------------------------------
+        result = self._identify_with_sift(image, source)
+        if not result:
+            self._save_query_image(image, source, "nomatch")
+        return result
+
+    def _identify_with_nbis(self, image, source="UNKNOWN"):
+        """1:N minutiae matching. Returns (client_id, name, confidence) or None."""
+        engine_name = getattr(self.nbis_module, "__name__", "minutiae")
+        try:
+            result = self.nbis_module.identify(
+                self.nbis,
+                image,
+                self.registered_fingerprints,
+                self.nbis_gallery,
+            )
+        except Exception as e:  # noqa: BLE001 - a bad scan must not kill the listener
+            print(f"❌ [{source}] {engine_name} identification error: {e}")
+            return None
+
+        if result:
+            client_id, name, score, details = result
+            runner_up = details['ranking'][1][2] if len(details['ranking']) > 1 else 0
+            print(f"✅ [{source}] MATCH: {name} (ID: {client_id}) - score {score} "
+                  f"(runner-up {runner_up}, {details['compared']} templates in {details['elapsed']:.2f}s)")
+            self._save_query_image(image, source, f"match_{client_id}")
+            # Report a 0-1 confidence to callers that expect a percentage.
+            confidence = min(1.0, score / max(self.nbis.threshold * 2.0, 1.0))
+            return (client_id, name, confidence)
+
+        print(f"❌ [{source}] NO MATCH ({engine_name}, threshold {self.nbis.threshold})")
+        return None
+
+    def _identify_with_sift(self, image, source="UNKNOWN"):
+        """Original SIFT/ORB + FAISS matcher."""
+        # Without FAISS there is no index to search, and identify_fingerprint_fast
+        # would return None for everyone - scan the profiles directly instead.
+        if not FAISS_AVAILABLE:
+            return self._identify_sift_bruteforce(image, source)
+
+        # Build/rebuild FAISS index if needed
+        if self.processor.faiss_index is None:
+            print(f"🔨 Building FAISS index for {len(self.registered_fingerprints)} clients...")
+            self.processor.build_faiss_index(self.registered_fingerprints)
+
+        # The FAISS pre-filter ranks on mean-pooled descriptors, which barely
+        # separates fingerprints, so keep a wide candidate list - with only 5 the
+        # right member is usually thrown away before verification.
+        result = self.processor.identify_fingerprint_fast(
+            image,
+            self.registered_fingerprints,
+            threshold=MATCH_THRESHOLD,
+            top_k_candidates=50
+        )
+
+        if result:
+            client_id, name, confidence = result
+            print(f"✅ [{source}] MATCH (SIFT): {name} (ID: {client_id}) - {confidence*100:.1f}%")
+            return (client_id, name, confidence)
+
+        print(f"❌ [{source}] NO MATCH (SIFT, threshold {MATCH_THRESHOLD})")
+        return None
+
+    def _identify_sift_bruteforce(self, image, source="UNKNOWN"):
+        """SIFT verification against every enrolled sample (no FAISS pre-filter)."""
         features = self.processor.extract_features(image)
-        
         if features is None:
             print(f"✗ [{source}] Failed to extract features")
             return None
-        
-        print(f"✓ [{source}] Extracted {features['num_features']} features")
-        
-        # Match against database
+
         best_match = None
         best_score = 0.0
-        
-        if not self.registered_fingerprints:
-            print(f"⚠️ [{source}] No fingerprints loaded in database")
-            return None
-        
-        print(f"🔍 [{source}] Checking against {len(self.registered_fingerprints)} enrolled clients...")
-        
+
         for person in self.registered_fingerprints:
-            client_id = person['client_id']
-            name = person['name']
-            
-            # Get all fingerprints (could be 'fingerprints' for backward compat or 'fingers' for new structure)
             if 'fingers' in person:
-                # New structure: grouped by fingers
                 all_samples = []
                 for finger in person['fingers']:
                     all_samples.extend(finger.get('samples', []))
             else:
-                # Old structure: flat list
                 all_samples = person.get('fingerprints', [])
-            
-            if not all_samples:
-                continue
-            
-            # Compare with all samples from all fingers
+
             scores = []
-            for enrolled_fp in all_samples:
-                try:
-                    if not isinstance(enrolled_fp, dict):
-                        continue
-                    if 'descriptors' not in enrolled_fp:
-                        continue
-                    desc = enrolled_fp.get('descriptors')
-                    if desc is None or (hasattr(desc, '__len__') and len(desc) == 0):
-                        continue
-                    score = self.processor.match_fingerprints(features, enrolled_fp)
-                    scores.append(score)
-                except Exception as e:
-                    # Skip samples that cause errors
+            for enrolled in all_samples:
+                if not isinstance(enrolled, dict):
                     continue
-            
+                descriptors = enrolled.get('descriptors')
+                if descriptors is None or len(descriptors) == 0:
+                    continue
+                scores.append(self.processor.match_fingerprints_detailed(features, enrolled))
+
             if not scores:
                 continue
-                
-            # Use average of top 5 scores (we have 5 samples per finger, 2 fingers = 10 total)
             scores.sort(reverse=True)
-            avg_score = np.mean(scores[:5]) if len(scores) >= 5 else np.mean(scores)
-            
-            if avg_score > best_score:
-                best_score = avg_score
-                best_match = (client_id, name)
-                print(f"  📊 [{source}] Best so far: {name} - {avg_score*100:.1f}% ({len(scores)} valid matches)")
-        
-        # Check threshold
+            score = float(np.mean(scores[:5]))
+            if score > best_score:
+                best_score = score
+                best_match = (person['client_id'], person['name'])
+
         if best_match and best_score >= MATCH_THRESHOLD:
             client_id, name = best_match
-            print(f"✅ [{source}] MATCH: {name} (ID: {client_id}) - {best_score*100:.1f}%")
-            send_str = f"✅ [{source}] MATCH: {name} (ID: {client_id}) - {best_score*100:.1f}%"
-            self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-            self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+            print(f"✅ [{source}] MATCH (SIFT brute force): {name} (ID: {client_id}) - {best_score*100:.1f}%")
             return (client_id, name, best_score)
-        else:
-            if best_match:
-                print(f"❌ [{source}] NO MATCH - Best: {best_match[1]} (Score: {best_score*100:.1f}%, Threshold: {MATCH_THRESHOLD*100:.1f}%)")
-            else:
-                print(f"❌ [{source}] NO MATCH - No fingerprints found in database")
-            return None
+
+        print(f"❌ [{source}] NO MATCH (SIFT brute force, best {best_score*100:.1f}%, "
+              f"threshold {MATCH_THRESHOLD*100:.1f}%)")
+        return None
+
+    @staticmethod
+    def _save_query_image(image, source, outcome):
+        """Keep the query image when FINGERPRINT_SAVE_QUERY_IMAGES=1 (threshold tuning)."""
+        if IMAGE_STORE_AVAILABLE:
+            fingerprint_image_store.save_query_image(image, source, outcome)
     
     def enroll_client_fingerprint(self, client_id, use_entrance_esp=True):
         """
@@ -637,7 +882,9 @@ class DualESP32FingerprintSystem:
             esp_port = ENTRANCE_ESP_PORT if use_entrance_esp else LOCKER_ESP_PORT
             
             samples = []
-            for i in range(SAMPLES_PER_FINGER):
+            retries_left = ENROLL_RETRY_BUDGET
+            while len(samples) < SAMPLES_PER_FINGER:
+                i = len(samples)
                 print(f"\n📌 Finger {finger_index} - Sample {i+1}/{SAMPLES_PER_FINGER}")
                 send_str = f"\n📌 Finger {finger_index} - Sample {i+1}/{SAMPLES_PER_FINGER}"
                 self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
@@ -658,17 +905,44 @@ class DualESP32FingerprintSystem:
                     print(f"✗ Failed to receive sample {i+1}")
                     return False
                 
-                # Extract features
+                # Save the raw image and run both engines on it
                 print("🔍 Extracting features...")
-                features = self.processor.extract_features(image)
+                features = build_sample_record(
+                    image, self.processor,
+                    client_id=client_id, finger_index=finger_index, sample_number=i + 1,
+                    nbis_engine=self.nbis
+                )
                 
                 if features is None:
                     print(f"✗ Failed to extract features from sample {i+1}")
+                    retries_left -= 1
+                    if retries_left < 0:
+                        print("✗ Too many unusable presses - aborting this finger")
+                        return False
                     continue
-                
+
+                # Quality gate: an impression this weak cannot be matched later,
+                # so spend a retry on it rather than storing it forever.
+                minutiae = features.get('minutiae_count')
+                if minutiae is not None and minutiae < MIN_ENROLL_MINUTIAE:
+                    retries_left -= 1
+                    warn = (f"⚠️  Rejected: only {minutiae} minutiae (need "
+                            f"{MIN_ENROLL_MINUTIAE}) - press firmer and cover the whole window")
+                    print(warn)
+                    try:
+                        self.sock.sendto(warn.encode("utf-8"), (pc_ip, pc_port))
+                        self.sock.sendto(warn.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+                    except Exception:
+                        pass
+                    if retries_left < 0:
+                        print("✗ Could not get enough good presses - clean the sensor and retry")
+                        return False
+                    continue
+
                 samples.append(features)
-                print(f"✓ Sample {i+1} captured ({features['num_features']} features)")
-                send_str = f"✓ Sample {i+1} captured ({features['num_features']} features)"
+                quality = f", {minutiae} minutiae" if minutiae else ""
+                print(f"✓ Sample {i+1} captured ({features['num_features']} features{quality})")
+                send_str = f"✓ Sample {i+1} captured ({features['num_features']} features{quality})"
                 self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
                 self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
                 
@@ -687,6 +961,10 @@ class DualESP32FingerprintSystem:
             success = self.db.save_fingerprint_features(client_id, finger_index, samples)
             
             if success:
+                # Both matchers cache enrolled data - make them pick up the new finger
+                nbis_invalidate_gallery()
+                self.processor.faiss_index = None
+                self.processor.cache_valid = False
                 print(f"✅ Saved {SAMPLES_PER_FINGER} samples for finger {finger_index}")
                 send_str = f"✅ Saved {SAMPLES_PER_FINGER} samples for finger {finger_index}"
                 self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
@@ -763,7 +1041,9 @@ class FingerprintGymSystem:
     def __init__(self, db_helper, auto_identify=False, identification_callback=None, sock=None, port=UDP_PORT_ENTRANCE):
         self.db = db_helper
         self.receiver = UDPFingerprintReceiver(port)
-        self.processor = FingerprintProcessor()
+        self.processor = ImprovedFingerprintProcessor(embedding_dim=128, use_pca=True)
+        self.nbis_module, self.nbis, self.nbis_gallery = get_minutiae_engine()
+        self.fingerprint_cache = None  # set via set_fingerprint_cache(); used by the auto loop
         self.sock = sock  # Socket for sending messages to ESP32
         
         # Load registered fingerprints
@@ -781,6 +1061,12 @@ class FingerprintGymSystem:
         
         print("✅ Fingerprint gym system initialized")
     
+    def set_fingerprint_cache(self, fingerprint_cache):
+        """Set or update the shared fingerprint cache reference"""
+        self.fingerprint_cache = fingerprint_cache
+        if fingerprint_cache:
+            self.registered_fingerprints = fingerprint_cache.get_fingerprints()
+
     def reload_fingerprints(self):
         """Reload all registered fingerprints from database"""
         try:
@@ -835,9 +1121,13 @@ class FingerprintGymSystem:
                 else:
                     return False
             
-            # Extract features
+            # Save the raw image and run both engines on it
             print("🔍 Extracting features...")
-            features = self.processor.extract_features(image)
+            features = build_sample_record(
+                image, self.processor,
+                client_id=client_id, finger_index=1, sample_number=i + 1,
+                nbis_engine=self.nbis
+            )
             
             if features is None:
                 print(f"✗ Failed to extract features from sample {i+1}")
