@@ -28,6 +28,18 @@
   UpImage delivers it 4-bit packed (2 px/byte); some clone modules send
   8-bit - both are handled.
   ------------------------------------------------------------------
+  Wiring (serial RFID reader, entrance role only):
+    reader TX      -> GPIO 25  (RFID_RX_PIN)
+    reader RX      -> GPIO 26  (RFID_TX_PIN, only if the reader needs commands)
+    reader VCC/GND -> 5V / GND (or 3.3V if the module allows it)
+
+  5V readers (RDM6300 and most 125 kHz modules) drive TX at 5V - put a
+  divider on it (e.g. 1k from TX to GPIO 25, 2k from GPIO 25 to GND).
+
+  Each card shown is sent to the PC once as "RFID:<uid>" on UDP 8891
+  (rfid_gym.py). Both RDM6300 frames (STX + 10 hex ID + 2 hex checksum +
+  ETX) and plain-text readers (ID followed by CR/LF) are understood.
+  ------------------------------------------------------------------
 */
 
 #include <WiFi.h>
@@ -38,10 +50,10 @@
 #define ROLE 0
 
 // ---------------------------------------------------------------- network --
-const char* ssid     = "Amin";
-const char* password = "amin% 1993";
+const char* ssid     = "Autoro";
+const char* password = "#Autoro@2027";
 
-const char* pcIP = "192.168.1.106";       // PC running fingerprint_gym.py
+const char* pcIP = "192.168.1.4";       // PC running fingerprint_gym.py
 #if ROLE == 0
 const int   imagePort = 8889;             // UDP_PORT_ENTRANCE
 IPAddress   local_IP(192, 168, 1, 120);   // ENTRANCE_ESP_IP
@@ -64,6 +76,18 @@ WiFiUDP udp;
 #define TOUCH_PIN   17     // sensor WAKEUP (blue). -1 = poll GenImg instead
 #define TOUCH_ACTIVE LOW  // WAKEUP level when a finger is present
 #define LED_PIN      2     // onboard LED
+
+// ---------------------------------------------------------------- rfid -----
+// Serial RFID reader on the second UART. Readers repeat the ID for as long as
+// the card stays in the field; one presentation must count as one read, so
+// the same card is ignored until it has been away for RFID_REPEAT_MS.
+#define RFID_ENABLED    (ROLE == 0)
+#define RFID_RX_PIN     25     // ESP32 receives here <- reader TX
+#define RFID_TX_PIN     26     // ESP32 transmits here -> reader RX
+#define RFID_BAUD       9600   // RDM6300 and most UART readers
+#define RFID_REPEAT_MS  3000
+#define RFID_IDLE_MS    60     // flush an unterminated ID after this much silence
+const int rfidPort = 8891;     // UDP_PORT_RFID on the PC
 
 // Blank-frame gate: a real fingerprint has contrast; an empty/backlit window is
 // nearly uniform. Frames with a pixel std-dev below this are not sent. The
@@ -314,6 +338,15 @@ void setup() {
                 WiFi.localIP().toString().c_str(), pcIP, imagePort);
   udp.begin(commandPort);                          // listen for PC feedback / test commands
 
+#if RFID_ENABLED
+  // Started before the fingerprint sensor so cards still work if the R503 is dead.
+  // The buffer holds reads that arrive while an image upload blocks the loop.
+  Serial1.setRxBufferSize(512);
+  Serial1.begin(RFID_BAUD, SERIAL_8N1, RFID_RX_PIN, RFID_TX_PIN);
+  Serial.printf("RFID reader on GPIO %d @ %d baud -> cards to %s:%d\n",
+                RFID_RX_PIN, RFID_BAUD, pcIP, rfidPort);
+#endif
+
   // ---- sensor: find its baud rate, prefer 115200 for the image upload ----
   Serial2.setRxBufferSize(4096);
   Serial2.begin(57600, SERIAL_8N1, RX2_PIN, TX2_PIN);
@@ -385,8 +418,9 @@ void sendStatus(const char* msg) {                 // to the PC monitor port
 
 void loop() {
   handleUdpCommands();
+  handleRfid();
 
-  if (!sensorOk) { delay(200); return; }
+  if (!sensorOk) { delay(30); return; }
 
   bool wantCapture = forceCapture;
   if (!wantCapture) {
@@ -414,6 +448,7 @@ void loop() {
       delay(60);                                   // no finger yet
     }
     handleUdpCommands();
+    handleRfid();
   }
   if (!usable) {
     if (forceCapture) { replyToTester("CAPTURE:TIMEOUT"); forceCapture = false; }
@@ -529,7 +564,7 @@ void loop() {
   // wait for the finger to lift so one press = one image
   if (TOUCH_PIN >= 0) {
     uint32_t lift = millis();
-    while (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE && millis() - lift < 5000) delay(20);
+    while (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE && millis() - lift < 5000) { handleRfid(); delay(20); }
   }
   sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
 }
@@ -578,6 +613,89 @@ void sendImageViaUDP() {
 }
 
 // ============================================================================
+// RFID reader (Serial1) -> PC
+// ============================================================================
+
+char     rfidBuf[24];
+uint8_t  rfidLen = 0;
+bool     rfidFramed = false;          // inside an RDM6300 STX..ETX frame
+uint32_t rfidLastByteMs = 0;
+char     lastCard[24] = "";
+uint32_t lastCardMs = 0;
+uint32_t rfidLedUntil = 0;            // when the ring goes back to idle (0 = not lit)
+
+static uint8_t hexNibble(char c) { return (c <= '9') ? c - '0' : c - 'A' + 10; }
+
+// Card feedback on the R503 ring, reset to idle breathing by handleRfid().
+void rfidLed(uint8_t ctrl, uint8_t color, uint32_t holdMs) {
+  if (!sensorOk) return;                           // the ring belongs to the R503
+  sensor.led(ctrl, color, 40, 0);
+  rfidLedUntil = millis() + holdMs;
+  if (rfidLedUntil == 0) rfidLedUntil = 1;
+}
+
+void handleRfid() {
+#if RFID_ENABLED
+  while (Serial1.available() > 0) {
+    int c = Serial1.read();
+    if (c < 0) break;
+    rfidLastByteMs = millis();
+    if (c == 0x02) {                               // STX: start of an RDM6300 frame
+      rfidFramed = true;
+      rfidLen = 0;
+    } else if (c == 0x03 || c == '\r' || c == '\n') {   // ETX or end of line
+      rfidFlush();
+    } else if (isalnum(c)) {
+      if (rfidLen < sizeof(rfidBuf) - 1) rfidBuf[rfidLen++] = (char)toupper(c);
+      else rfidLen = 0;                            // runaway line: drop it
+    }
+  }
+  // Readers that send the ID with no terminator: take it once the line goes quiet
+  if (rfidLen > 0 && millis() - rfidLastByteMs > RFID_IDLE_MS) rfidFlush();
+
+  if (rfidLedUntil != 0 && (int32_t)(millis() - rfidLedUntil) >= 0) {
+    rfidLedUntil = 0;
+    sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+  }
+#endif
+}
+
+void rfidFlush() {
+  bool framed = rfidFramed;
+  uint8_t len = rfidLen;
+  rfidBuf[len] = 0;
+  rfidFramed = false;
+  rfidLen = 0;
+  if (len == 0) return;
+
+  // RDM6300: 10 hex ID chars + 2 hex chars of XOR checksum over the 5 ID bytes
+  if (framed && len == 12) {
+    uint8_t x = 0;
+    for (int i = 0; i < 10; i += 2) x ^= (hexNibble(rfidBuf[i]) << 4) | hexNibble(rfidBuf[i + 1]);
+    uint8_t ck = (hexNibble(rfidBuf[10]) << 4) | hexNibble(rfidBuf[11]);
+    if (x != ck) { Serial.printf("RFID checksum error (%s) - ignored\n", rfidBuf); return; }
+    rfidBuf[10] = 0;
+    len = 10;
+  }
+  if (len < 4) return;                             // line noise, not an ID
+
+  uint32_t now = millis();
+  bool repeat = (strcmp(rfidBuf, lastCard) == 0 && now - lastCardMs < RFID_REPEAT_MS);
+  lastCardMs = now;                                // a held card keeps extending the window
+  if (repeat) return;
+  strcpy(lastCard, rfidBuf);
+
+  char msg[40];
+  snprintf(msg, sizeof(msg), "RFID:%s", rfidBuf);
+  udp.beginPacket(pcIP, rfidPort);
+  udp.write((const uint8_t*)msg, strlen(msg));
+  udp.endPacket();
+  Serial.printf("Card %s -> %s:%d\n", rfidBuf, pcIP, rfidPort);
+
+  rfidLed(LED_CTRL_ON, LED_PURPLE, 2000);          // "read"; the PC's verdict replaces it
+}
+
+// ============================================================================
 // Command / feedback channel (port 4210)
 // ============================================================================
 
@@ -597,6 +715,17 @@ void handleUdpCommands() {
   int n = udp.read(buf, sizeof(buf) - 1);
   if (n <= 0) return;
   buf[n] = 0;
+
+  // ---- RFID verdict from rfid_gym.py (kept apart from the tester's reply address) ----
+  if (strncasecmp(buf, "RFID:", 5) == 0) {
+    const char* v = buf + 5;
+    Serial.printf("RFID verdict: %s\n", v);
+    if      (strncasecmp(v, "OK", 2) == 0)       rfidLed(LED_CTRL_ON, LED_BLUE, 1500);
+    else if (strncasecmp(v, "ENROLLED", 8) == 0) rfidLed(LED_CTRL_FLASH, LED_BLUE, 2000);
+    else                                          rfidLed(LED_CTRL_FLASH, LED_RED, 2000);  // UNKNOWN / ENROLL_FAIL
+    return;
+  }
+
   lastCmdIP = udp.remoteIP();
   lastCmdPort = udp.remotePort();
   Serial.printf("UDP cmd from %s:%u : %s\n", lastCmdIP.toString().c_str(), lastCmdPort, buf);

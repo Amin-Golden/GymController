@@ -13,6 +13,7 @@ finger_enter_esp = 192, 168, 1, 120
 UDP_PORT_ENTRANCE = 8889  # Port for entrance ESP32 
 finger_locker_esp192, 168, 1, 121
 UDP_PORT_LOCKER = 8890    # Port for locker ESP32 
+UDP_PORT_RFID = 8891      # RFID cards from the entrance ESP32 (rfid_gym.py, run migrate_rfid.sql once)
 
 
 gst-launch-1.0 rtspsrc location=rtsp://192.168.1.110:8554/live latency=100 ! rtph264depay ! h264parse ! mppvideodec ! autovideosink

@@ -18,6 +18,7 @@ import ctypes
 from ctypes import *
 import traceback
 from fingerprint_gym import DualESP32FingerprintSystem
+from rfid_gym import RFIDEntranceSystem
 
 HEADLESS = os.environ.get('DISPLAY') is None
 
@@ -815,6 +816,7 @@ class AsyncRTSPReader:
 # When either system detects a client and performs entrance/exit, both systems respect the cooldown
 last_entrance_time = {}  # Track last entrance/exit time per client (shared by both systems)
 entrance_cooldown = 60  # 1 minute cooldown (shared)
+entrance_lock = threading.Lock()  # one entrance decision at a time
 
 def check_entrance_cooldown(client_id, client_name):
     """
@@ -843,103 +845,127 @@ def update_entrance_cooldown(client_id):
     global last_entrance_time
     last_entrance_time[client_id] = time.time()
 
-def on_entrance_fingerprint(client_id, client_name, confidence):
-    """Handle entrance fingerprint with cooldown and proper entry/exit logic"""
-    if client_id is None:
-        return
-    
-    # Check shared cooldown (face and fingerprint systems share this)
-    is_cooldown, remaining = check_entrance_cooldown(client_id, client_name)
-    if is_cooldown:
-        print(f"⏳ Entrance cooldown active for {client_name} ({remaining}s remaining)")
-        return
-    
-    # Get client info
-    client_info = get_client_info_cached(client_id)
-    if not client_info:
-        print(f"❌ Client info not found for {client_id}")
-        return
-    
-    if client_info['locker'] is None:
-        # ENTRY - assign locker
-        print(f"🚪 ENTRY detected for {client_name}")
-        send_str = f"ENTRY detected for {client_name}"
-        sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-        sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-        
-        # Check membership and sessions
-        membership_info = db.check_membership_sessions(client_id)
-        
-        if not membership_info:
-            print(f"❌ {client_name} does not have an active membership!")
-            return
-        
-        if not membership_info['is_paid']:
-            print(f"❌ {client_name}'s membership is not paid!")
-            return
-        
-        if not membership_info['has_access']:
-            print(f"❌ {client_name} has NO remaining sessions!")
-            print(f"   Current sessions: {membership_info['remain_sessions']}")
-            return
-        
-        # Get available locker
-        available_locker = db.get_available_locker()
-        if available_locker is None:
-            print(f"⚠️  No available lockers for {client_name}")
-            return
-        
-        # Assign locker
-        success = db.assign_locker_to_client(client_id, available_locker)
-        if not success:
-            print(f"❌ Failed to assign locker to {client_name}")
-            return
-        
-        # Decrease session count
-        session_decreased = db.decrease_membership_session(client_id)
-        if not session_decreased:
-            print(f"⚠️  Locker assigned but session count NOT decreased!")
-        
-        # Record entrance
-        entrance_recorded = db.record_entrance(client_id, available_locker)
-        if not entrance_recorded:
-            print(f"⚠️  Locker assigned but entrance recording failed")
-        
-        print(f"🎉 ENTRY: {client_name} → Locker #{available_locker + 1}")
-        print(f"   Remaining sessions: {membership_info['remain_sessions'] - 1}")
-        
-        # Update shared cooldown (face and fingerprint systems share this)
-        update_entrance_cooldown(client_id)
+def open_locker(locker_number):
+    """Send the unlock command for a 1-based locker number to the ESP32 that drives it"""
+    if 1 <= locker_number <= 24:
+        sock.sendto(str(locker_number).encode("utf-8"), (esp32_1_ip, esp32_1_port))
+        print(f"📤 Unlock command for locker {locker_number} sent to ESP32-1")
+    elif 25 <= locker_number <= 60:
+        sock.sendto(str(locker_number).encode("utf-8"), (esp32_2_ip, esp32_2_port))
+        print(f"📤 Unlock command for locker {locker_number} sent to ESP32-2")
     else:
-        # EXIT - return locker (client already has locker)
-        print(f"🚪 EXIT detected for {client_name}")
-        print(f"   Current locker: #{client_info['locker'] + 1}")
-        
-        # Record exit
-        exit_recorded = db.record_exit(client_id)
-        if not exit_recorded:
+        print(f"⚠️  Locker {locker_number} has no controller (ESP32-1: 1-24, ESP32-2: 25-60)")
+        return False
+    return True
+
+def handle_entrance(client_id, client_name, source):
+    """
+    Entry/exit at the gym entrance - one flow for face, fingerprint and RFID card.
+    - Entry: check membership and sessions, assign a free locker, use one session,
+      record the visit and open the locker
+    - Exit: record the exit and free the locker
+    Returns True when an entry or exit was performed.
+    """
+    # Face, fingerprint and card run on separate threads; one person showing
+    # their face and a card together must not be processed twice (entry + exit).
+    with entrance_lock:
+        # Check shared cooldown (face, fingerprint and card share this)
+        is_cooldown, remaining = check_entrance_cooldown(client_id, client_name)
+        if is_cooldown:
+            print(f"⏳ Entrance cooldown active for {client_name} ({remaining}s remaining)")
+            return False
+
+        client_info = get_client_info_cached(client_id)
+        if not client_info:
+            print(f"❌ Client info not found for {client_name}")
+            return False
+
+        current_locker = client_info['locker']
+
+        if current_locker is None:
+            # ===== ENTRY: Check sessions, assign and open locker =====
+            print(f"🚪 ENTRY detected for {client_name} ({source})")
+            send_str = f"ENTRY detected for {client_name}"
+            sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
+            sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+
+            membership_info = db.check_membership_sessions(client_id)
+
+            if not membership_info:
+                print(f"❌ {client_name} does not have an active membership!")
+                print(f"   Please ensure membership is active and paid.")
+                return False
+
+            if not membership_info['is_paid']:
+                print(f"❌ {client_name}'s membership is not paid!")
+                return False
+
+            if not membership_info['has_access']:
+                print(f"❌ {client_name} has NO remaining sessions!")
+                print(f"   Current sessions: {membership_info['remain_sessions']}")
+                print(f"   Please renew membership or add more sessions.")
+                return False
+
+            print(f"✅ Access GRANTED for {client_name}")
+            print(f"   Remaining sessions: {membership_info['remain_sessions']}")
+            print(f"   Valid until: {membership_info['end_date']}")
+
+            available_locker = db.get_available_locker()
+            if available_locker is None:
+                print(f"⚠️  No available lockers for {client_name}")
+                return False
+
+            if not db.assign_locker_to_client(client_id, available_locker):
+                print(f"❌ Failed to assign locker to {client_name}")
+                return False
+
+            if not db.decrease_membership_session(client_id):
+                print(f"⚠️  Locker assigned but session count NOT decreased!")
+            else:
+                print(f"✅ Session count decreased successfully")
+
+            if not db.record_entrance(client_id, available_locker):
+                print(f"⚠️  Locker assigned but entrance recording failed")
+
+            print(f"🎉 ENTRY COMPLETE: {client_name} → Locker #{available_locker + 1}")
+
+            open_locker(available_locker + 1)
+
+            update_entrance_cooldown(client_id)
+            return True
+
+        # ===== EXIT: Unassign locker (NO session change on exit) =====
+        print(f"🚪 EXIT detected for {client_name} ({source})")
+        print(f"   Current locker: #{current_locker + 1}")
+
+        if not db.record_exit(client_id):
             print(f"⚠️  No open session found for exit recording")
-        
-        # Unassign locker
-        success = db.unassign_locker(client_id)
-        if not success:
+
+        if not db.unassign_locker(client_id):
             print(f"❌ Failed to unassign locker from {client_name}")
-            return
-        
-        # Display remaining sessions
+            return False
+
         summary = db.get_membership_summary(client_id)
         if summary:
             print(f"   Sessions remaining: {summary['sessions']}")
-        
-        print(f"👋 EXIT: {client_name} left gym")
+
+        print(f"👋 EXIT COMPLETE: {client_name} left gym")
         send_str = f"EXIT: {client_name} left gym"
         sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
         sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-        send_str = f"OPEN"
-        sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-        
-        # Update shared cooldown (face and fingerprint systems share this)
+
         update_entrance_cooldown(client_id)
+        return True
+
+def on_entrance_fingerprint(client_id, client_name, confidence):
+    """Entrance fingerprint reader callback"""
+    if client_id is not None:
+        handle_entrance(client_id, client_name, "fingerprint")
+
+def on_entrance_card(client_id, client_name, confidence):
+    """Entrance RFID reader callback"""
+    if client_id is not None:
+        handle_entrance(client_id, client_name, "card")
 
 def on_locker_fingerprint(client_id, client_name, confidence):
     """
@@ -985,13 +1011,8 @@ def on_locker_fingerprint(client_id, client_name, confidence):
     
     # Send unlock command to appropriate ESP32
     try:
-        if locker_number > 0 and locker_number <= 24:
-            sock.sendto(str(locker_number).encode("utf-8"), (esp32_1_ip, esp32_1_port))
-            print(f"📤 Unlock command sent to ESP32-1")
-        elif locker_number > 24 and locker_number <= 60:
-            sock.sendto(str(locker_number).encode("utf-8"), (esp32_2_ip, esp32_2_port))
-            print(f"📤 Unlock command sent to ESP32-2")
-        
+        open_locker(locker_number)
+
         # Also send to Raspberry Pi
         sock.sendto(str(locker_number).encode("utf-8"), (raspi_locker_ip, raspi_locker_port))
         send_str = "Locker " + str(locker_number) + " unlocked"
@@ -1048,6 +1069,7 @@ if __name__ == '__main__':
     fingerprint_enrollment_processor = None
     enrollment_processor = None
     fingerprint_notification_handler = None
+    rfid_system = None
     esp32_1_ip = "192.168.1.201"
     esp32_1_port = 4210
     esp32_2_ip = "192.168.1.202"
@@ -1151,7 +1173,7 @@ if __name__ == '__main__':
             
             if client_id is None:
                 return
-            if action == 'FINGERPRINT_ENROLL':
+            if action in ('FINGERPRINT_ENROLL', 'RFID_ENROLL'):
                 return
             
             if action == 'DELETE':
@@ -1243,6 +1265,12 @@ if __name__ == '__main__':
         # Start fingerprint auto-identification
         fingerprint_system.start_auto_identification()
 
+        # RFID cards at the entrance run the same entry/exit flow as face and fingerprint
+        rfid_system = RFIDEntranceSystem(db, on_entrance_card, sock=sock,
+                                         status_endpoints=status_endpoints)
+        db.register_notification_handler('RFID_ENROLL', rfid_system.handle_notification)
+        rfid_system.start()
+
         # Start listening for database changes
         db.start_listening(on_client_change)
 
@@ -1252,144 +1280,6 @@ if __name__ == '__main__':
         last_locker_open = {}  # Track last open locker time per client
         locker_open_cooldown = 15 
 
-        def assign_locker_to_recognized_face(client_id, client_name, similarity):
-            """
-            Assign/unassign locker based on recognition in USB camera
-            - Entry: Assign locker if client has active membership and no locker
-            - Exit: Unassign locker if client already has one
-            Uses shared entrance cooldown with fingerprint system
-            """
-            # Check shared cooldown (face and fingerprint systems share this)
-            is_cooldown, remaining = check_entrance_cooldown(client_id, client_name)
-            if is_cooldown:
-                print(f"⏳ Entrance cooldown active for {client_name} ({remaining}s remaining)")
-                return False
-            
-            # 1. Check if client has active membership
-            membership = db.check_active_membership(client_id)
-            
-            if not membership:
-                print(f"❌ {client_name} does not have an active membership!")
-                # print(f"   Please ensure membership is paid and not expired.")
-                return False
-            
-            if not membership['is_paid']:
-                print(f"❌ {client_name}'s membership is not paid!")
-                return False
-            
-            print(f"✅ Active membership verified for {client_name}")
-            # print(f"   Valid until: {membership['end_date']}")
-            
-            # 2. Get client info to check current locker status
-            client_info = get_client_info_cached(client_id)
-            
-            if not client_info:
-                print(f"❌ Client info not found for {client_name}")
-                return False
-            
-            current_locker = client_info['locker']
-            
-            # 3. Determine if this is ENTRY or EXIT
-            # Determine if this is ENTRY or EXIT
-            if current_locker is None:
-                # ===== ENTRY: Check sessions and assign locker =====
-                print(f"🚪 ENTRY detected for {client_name}")
-                send_str = f"ENTRY detected for {client_name}"
-                sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-                sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-                
-                # 1. Check membership and remaining sessions
-                membership_info = db.check_membership_sessions(client_id)
-                
-                if not membership_info:
-                    print(f"❌ {client_name} does not have an active membership!")
-                    print(f"   Please ensure membership is active and paid.")
-                    return False
-                
-                if not membership_info['is_paid']:
-                    print(f"❌ {client_name}'s membership is not paid!")
-                    return False
-                
-                if not membership_info['has_access']:
-                    print(f"❌ {client_name} has NO remaining sessions!")
-                    print(f"   Current sessions: {membership_info['remain_sessions']}")
-                    print(f"   Please renew membership or add more sessions.")
-                    return False
-                
-                print(f"✅ Access GRANTED for {client_name}")
-                print(f"   Remaining sessions: {membership_info['remain_sessions']}")
-                print(f"   Valid until: {membership_info['end_date']}")
-                
-                # 2. Find available locker
-                available_locker = db.get_available_locker()
-                
-                if available_locker is None:
-                    print(f"⚠️  No available lockers for {client_name}")
-                    return False
-                
-                # 3. Assign locker
-                success = db.assign_locker_to_client(client_id, available_locker)
-                
-                if not success:
-                    print(f"❌ Failed to assign locker to {client_name}")
-                    return False
-                
-                # 4. Decrease session count (CRITICAL!)
-                session_decreased = db.decrease_membership_session(client_id)
-                
-                if not session_decreased:
-                    print(f"⚠️  Locker assigned but session count NOT decreased!")
-                    # Consider rolling back locker assignment
-                else:
-                    print(f"✅ Session count decreased successfully")
-                
-                # 5. Record entrance time
-                entrance_recorded = db.record_entrance(client_id, available_locker)
-                
-                if not entrance_recorded:
-                    print(f"⚠️  Locker assigned but entrance recording failed")
-                
-                print(f"🎉 ENTRY COMPLETE: {client_name} → Locker #{available_locker}")
-                print(f"   Entrance time recorded")
-                print(f"   Session consumed")
-                
-                # Send locker number to ESP32
-                sock.sendto(str(available_locker+1).encode("utf-8"), (esp32_1_ip, esp32_1_port))
-                
-                # Update shared cooldown (face and fingerprint systems share this)
-                update_entrance_cooldown(client_id)
-                return True
-                
-            else:
-                # ===== EXIT: Unassign locker (NO session change on exit) =====
-                print(f"🚪 EXIT detected for {client_name}")
-                print(f"   Current locker: #{current_locker+1}")
-                
-                # Record exit time
-                exit_recorded = db.record_exit(client_id)
-                
-                if not exit_recorded:
-                    print(f"⚠️  No open session found for exit recording")
-                
-                # Unassign locker
-                success = db.unassign_locker(client_id)
-                
-                if not success:
-                    print(f"❌ Failed to unassign locker from {client_name}")
-                    return False
-                
-                print(f"👋 EXIT COMPLETE: {client_name} left gym")
-                print(f"   Locker #{current_locker} is now available")
-                print(f"   Exit time recorded")
-                
-                # Display remaining sessions for next visit (NEW!)
-                summary = db.get_membership_summary(client_id)
-                if summary:
-                    print(f"   Sessions remaining: {summary['sessions']}")
-                
-                # Update shared cooldown (face and fingerprint systems share this)
-                update_entrance_cooldown(client_id)
-                return True               
         # GStreamer pipeline for low-latency RTSP
         camrstp = "rtsp://192.168.1.110:8554/live"
         entrance_camrstp = "rtsp://192.168.1.111:8554/live"
@@ -1669,10 +1559,7 @@ if __name__ == '__main__':
                                     send_str = "Locker " + str(locker_numbers) + " unlocked"
                                     sock.sendto(str(locker_numbers).encode("utf-8"), (raspi_locker_ip, raspi_locker_port))
                                     sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-                                    if locker_numbers > 0 and locker_numbers < 25:
-                                        sock.sendto(str(locker_numbers).encode("utf-8"), (esp32_1_ip, esp32_1_port))
-                                    elif locker_numbers > 25 and locker_numbers < 61:
-                                        sock.sendto(str(locker_numbers).encode("utf-8"), (esp32_2_ip, esp32_2_port))
+                                    open_locker(locker_numbers)
 
 
                                     # Update last unlock time
@@ -1833,7 +1720,7 @@ if __name__ == '__main__':
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                                 
                                 # Assign or unassign locker
-                                assign_locker_to_recognized_face(client_id, client_name, best_similarity)
+                                handle_entrance(client_id, client_name, "face")
                             else:
                                 # Unknown face
                                 cv2.rectangle(frame, (data[0], data[1]), (data[2], data[3]), (0, 0, 255), 2)
@@ -1946,6 +1833,13 @@ if __name__ == '__main__':
                 db.unregister_notification_handler('FINGERPRINT_ENROLL', fingerprint_notification_handler)
             except Exception as unregister_err:
                 print(f"⚠️ Unable to unregister fingerprint handler: {unregister_err}")
+        if rfid_system:
+            try:
+                db.unregister_notification_handler('RFID_ENROLL', rfid_system.handle_notification)
+                rfid_system.close()
+                print("✓ RFID system closed")
+            except Exception as rfid_err:
+                print(f"⚠️ Error closing RFID system: {rfid_err}")
         if fingerprint_enrollment_processor:
             try:
                 fingerprint_enrollment_processor.stop()

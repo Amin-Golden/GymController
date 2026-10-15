@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS public.clients
     image_path text,
     description text,
     locker integer,
+    rfid_uid character varying(32),
     weight real,
     height real,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
@@ -309,6 +310,7 @@ CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON public.access_logs(times
 CREATE INDEX IF NOT EXISTS idx_access_logs_granted ON public.access_logs(access_granted);
 
 CREATE INDEX IF NOT EXISTS idx_clients_locker ON public.clients(locker) WHERE locker IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_rfid_uid ON public.clients(rfid_uid) WHERE rfid_uid IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_memberships_client_id ON public.memberships(client_id);
 CREATE INDEX IF NOT EXISTS idx_memberships_end_date ON public.memberships(end_date);

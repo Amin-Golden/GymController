@@ -288,6 +288,55 @@ class DatabaseHelper:
             if connection:
                 self.return_connection(connection)
 
+    def get_client_by_rfid(self, rfid_uid):
+        """Return (client_id, name) of the member who owns this card, or None"""
+        connection = None
+        try:
+            connection = self.get_connection_with_timeout()
+            if connection is None:
+                return None
+            cursor = connection.cursor()
+
+            cursor.execute("SELECT id, fname, lname FROM clients WHERE rfid_uid = %s", (rfid_uid,))
+            result = cursor.fetchone()
+            cursor.close()
+
+            if result:
+                return (result[0], f"{result[1]} {result[2] or ''}".strip())
+            return None
+
+        except Exception as e:
+            print(f"❌ Error looking up RFID card {rfid_uid}: {e}")
+            return None
+        finally:
+            if connection:
+                self.return_connection(connection)
+
+    def set_client_rfid(self, client_id, rfid_uid):
+        """Link a card to a member (rfid_uid=None unlinks it). Returns True on success."""
+        connection = None
+        try:
+            connection = self.get_connection_with_timeout()
+            if connection is None:
+                return False
+            cursor = connection.cursor()
+
+            cursor.execute("UPDATE clients SET rfid_uid = %s WHERE id = %s", (rfid_uid, client_id))
+            updated = cursor.rowcount == 1
+
+            connection.commit()
+            cursor.close()
+            return updated
+
+        except Exception as e:
+            print(f"❌ Error saving RFID card for client {client_id}: {e}")
+            if connection:
+                connection.rollback()
+            return False
+        finally:
+            if connection:
+                self.return_connection(connection)
+
     def check_embedding_exists(self, client_id):
         """Check if face embedding exists for a client"""
         connection = None
