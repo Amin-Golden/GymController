@@ -603,7 +603,7 @@ class DatabaseHelper:
             
             if existing:
                 print(f"⚠️  Locker {locker_number} is already assigned to client {existing[0]} ({existing[1]} {existing[2]})")
-                send_str = f"⚠️  Locker {locker_number} is already assigned to client {existing[0]} ({existing[1]} {existing[2]})"
+                send_str = f"Locker {locker_number} is already assigned to client {existing[0]} ({existing[1]} {existing[2]})"
                 sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
                 # sock.sendto(send_str.encode("utf-8"), (ENTRANCE_ESP_IP, ENTRANCE_ESP_PORT))
                 # Optionally, you could unassign it first
@@ -1502,12 +1502,15 @@ class DatabaseHelper:
         """
         connection = None
         try:
+            self.last_fingerprint_error = None
             if not features_list or len(features_list) == 0:
                 print(f"❌ No features provided for client {client_id}")
+                self.last_fingerprint_error = "no samples to save"
                 return False
-            
+
             connection = self.get_connection_with_timeout(timeout=5.0)
             if connection is None:
+                self.last_fingerprint_error = "no database connection"
                 return False
             
             cursor = connection.cursor()
@@ -1596,6 +1599,7 @@ class DatabaseHelper:
             
         except Exception as e:
             print(f"❌ Error saving fingerprint features: {e}")
+            self.last_fingerprint_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
             import traceback
             traceback.print_exc()
             if connection:
@@ -1877,6 +1881,54 @@ class DatabaseHelper:
             
         except Exception as e:
             print(f"❌ Error checking fingerprint: {e}")
+            return False
+        finally:
+            if connection:
+                self.return_connection(connection)
+
+    # The whole-finger template stitched from all presses of one finger is
+    # stored as an extra sample with this number (presses are numbered from 1).
+    FUSED_SAMPLE_NUMBER = 0
+
+    def save_fused_template(self, client_id, finger_index, xyt, minutiae_count):
+        """Store (or replace) the stitched whole-finger template of one finger. True on success."""
+        if 'xyt_template' not in self.get_fingerprint_columns():
+            print("⚠️  Cannot store the fused fingerprint template - run migrate_fingerprint_nbis.sql")
+            return False
+        connection = None
+        try:
+            connection = self.get_connection_with_timeout(timeout=3.0)
+            if connection is None:
+                return False
+            cursor = connection.cursor()
+            cursor.execute(
+                "DELETE FROM fingerprint_features WHERE client_id = %s AND finger_index = %s AND sample_number = %s",
+                (client_id, finger_index, self.FUSED_SAMPLE_NUMBER))
+
+            columns = ['client_id', 'finger_index', 'sample_number', 'descriptors',
+                       'keypoints_data', 'num_features', 'confidence', 'xyt_template']
+            values = [client_id, finger_index, self.FUSED_SAMPLE_NUMBER,
+                      psycopg2.Binary(b''), psycopg2.Binary(pickle.dumps([])), 0, 1.0, xyt]
+            if 'minutiae_count' in self.get_fingerprint_columns():
+                columns.append('minutiae_count')
+                values.append(int(minutiae_count))
+            columns.append('updated_at')
+            values.append(datetime.now())
+
+            placeholders = ', '.join(['%s'] * len(values))
+            cursor.execute(f"INSERT INTO fingerprint_features ({', '.join(columns)}) VALUES ({placeholders})",
+                           tuple(values))
+            connection.commit()
+            cursor.close()
+            print(f"✅ Saved whole-finger template for client {client_id}, finger {finger_index} "
+                  f"({minutiae_count} minutiae)")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error saving fused fingerprint template: {e}")
+            self.last_fingerprint_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+            if connection:
+                connection.rollback()
             return False
         finally:
             if connection:

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Simulate the entrance ESP32's RFID reader without hardware.
+Simulate an ESP32's RFID reader (entrance or locker) without hardware.
 
 Sends "RFID:<uid>" to the controller exactly like finger_UDP.ino does and
-prints the verdict it answers with (RFID:OK / UNKNOWN / ENROLLED / ENROLL_FAIL).
+prints the verdict it answers with (RFID:OK / DENIED / UNKNOWN / ENROLLED / ENROLL_FAIL).
 
     python test/test_rfid_udp.py 0F00A1B2C3                     # controller on localhost
     python test/test_rfid_udp.py 0F00A1B2C3 --host 192.168.1.100
+    python test/test_rfid_udp.py 0F00A1B2C3 --host 192.168.1.100 --port 8892   # locker reader
 
-A card read here goes through the real entry/exit flow (locker, sessions),
-so use a test member's card ID.
+A card read here goes through the real flow - entry/exit on 8891, opening the
+member's locker on 8892 - so use a test member's card ID.
 """
 
 import argparse
@@ -18,7 +19,7 @@ import socket
 parser = argparse.ArgumentParser(description="Send a fake RFID card read to rfid_gym.py")
 parser.add_argument("uid", help="card ID, e.g. 0F00A1B2C3")
 parser.add_argument("--host", default="127.0.0.1", help="machine running RetinaFaceL.py")
-parser.add_argument("--port", type=int, default=8891, help="UDP_PORT_RFID")
+parser.add_argument("--port", type=int, default=8891, help="8891 entrance, 8892 locker")
 parser.add_argument("--timeout", type=float, default=5.0)
 args = parser.parse_args()
 

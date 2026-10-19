@@ -1,0 +1,61 @@
+ python GymController.pyc --model_path model/retinaface.rknn --db_host 192.168.1.3
+[OK] FAISS available - using fast similarity search
+🔌 Connecting to database...
+✅ Database connection pool created successfully
+🖐️ Initializing fingerprint system...
+🖐️ Fingerprint system initialized
+[OK] Using SIFT for fingerprint feature extraction
+[OK] Improved fingerprint processor initialized
+  - Embedding dimension: 128
+  - FAISS available: True
+  - PCA enabled: True
+[WARNING] NBIS not available (missing: mindtct, bozorth3)
+          Set NBIS_BIN_DIR or see NBIS_SETUP.md. NBIS is optional: fingerprint_local.py is a pure-Python replacement.
+[OK] Local fingerprint engine (pure Python), threshold 6
+[INFO] NBIS not installed - using the pure-Python minutiae engine
+✓ Fingerprint UDP receiver listening on port 8889
+✓ Fingerprint UDP receiver listening on port 8890
+🔄 Loaded 133 fingerprint profiles (1260 total samples)
+✅ Dual ESP32 fingerprint system initialized
+/home/orangepi/.local/lib/python3.10/site-packages/rknnlite/api/rknn_lite.py:41: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+W rknn-toolkit-lite2 version: 2.3.2
+W rknn-toolkit-lite2 version: 2.3.2
+done
+done
+--> Init runtime environment
+I RKNN: [15:32:28.891] RKNN Runtime Information, librknnrt version: 2.3.2 (429f97ae6b@2025-04-09T09:09:27)
+I RKNN: [15:32:28.892] RKNN Driver Information, version: 0.9.3
+I RKNN: [15:32:28.896] RKNN Model Information, version: 6, toolkit version: 2.3.2(compiler version: 2.3.2 (e045de294f@2025-04-07T19:48:25)), target: RKNPU v2, target platform: rk3588, framework name: ONNX, framework layout: NCHW, model inference type: static_shape
+W RKNN: [15:32:28.946] query RKNN_QUERY_INPUT_DYNAMIC_RANGE error, rknn model is static shape type, please export rknn with dynamic_shapes
+W Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID. (If it is a static shape RKNN model, please ignore the above warning message.)
+I RKNN: [15:32:29.007] RKNN Runtime Information, librknnrt version: 2.3.2 (429f97ae6b@2025-04-09T09:09:27)
+I RKNN: [15:32:29.007] RKNN Driver Information, version: 0.9.3
+I RKNN: [15:32:29.007] RKNN Model Information, version: 6, toolkit version: 2.3.2(compiler version: 2.3.2 (e045de294f@2025-04-07T19:48:25)), target: RKNPU v2, target platform: rk3588, framework name: ONNX, framework layout: NCHW, model inference type: static_shape
+W RKNN: [15:32:29.160] query RKNN_QUERY_INPUT_DYNAMIC_RANGE error, rknn model is static shape type, please export rknn with dynamic_shapes
+W Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID. (If it is a static shape RKNN model, please ignore the above warning message.)
+done
+📥 Loading biometric data from database...
+✅ Loaded 911 face embeddings
+✅ Loaded 133 fingerprint profiles
+👂 Entrance ESP32 listening on port 8889...
+🚪 Entrance listener started (Port 8889)
+👂 Locker ESP32 listening on port 8890...
+🔐 Locker listener started (Port 8890)
+✓ RFID ENTRANCE receiver listening on port 8891
+✓ RFID LOCKER receiver listening on port 8892
+👂 RFID entrance reader listening on port 8891...
+💳 RFID entrance listener started (Port 8891)
+👂 RFID locker reader listening on port 8892...
+💳 RFID locker listener started (Port 8892)
+🎧 Started listening for database changes...
+🎬 Starting main recognition loop...
+============================================================
+[ WARN:0@191.740] global cap_gstreamer.cpp:1750 open OpenCV | GStreamer warning: frame count is estimated by duration and fps
+[ WARN:0@191.741] global cap_gstreamer.cpp:1777 open OpenCV | GStreamer warning: Cannot query video position: status=1, value=38, duration=0
+✅ SUCCESS! Pipeline entrance works!
+[ WARN:0@191.743] global cap_gstreamer.cpp:2152 setProperty OpenCV | GStreamer warning: GStreamer: unhandled property
+[ WARN:1@191.773] global cap_gstreamer.cpp:1750 open OpenCV | GStreamer warning: frame count is estimated by duration and fps
+[ WARN:1@191.774] global cap_gstreamer.cpp:1777 open OpenCV | GStreamer warning: Cannot query video position: status=1, value=39, duration=0
+✅ SUCCESS! Pipeline 1 works!
+[ WARN:1@191.774] global cap_gstreamer.cpp:2152 setProperty OpenCV | GStreamer warning: GStreamer: unhandled property

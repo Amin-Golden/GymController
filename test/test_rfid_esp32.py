@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Hardware test for the RFID reader on the entrance ESP32 (finger_UDP/finger_UDP.ino).
+Hardware test for the RFID reader on an ESP32 (finger_UDP/finger_UDP.ino) -
+the entrance unit (cards on UDP 8891) or, with --locker, the locker unit (8892).
 
 Run it on the PC whose IP is pcIP in the sketch. It watches the ESP32 two ways
 at once - its USB serial log and the UDP packets it sends - so a failure says
@@ -20,6 +21,7 @@ Arduino Serial Monitor (it owns the COM port).
 Usage:
     py -3 test/test_rfid_esp32.py                      # COM4, resets the ESP32 first
     py -3 test/test_rfid_esp32.py --port COM5
+    py -3 test/test_rfid_esp32.py --locker             # locker ESP32 (ROLE 1, port 8892)
     py -3 test/test_rfid_esp32.py --no-reset           # keep it running, skip BOOT
     py -3 test/test_rfid_esp32.py --monitor            # just print every card read
                                                        # (handy to collect card IDs)
@@ -181,7 +183,7 @@ def countdown(text, seconds, receiver=None):
 
 # ---------------------------------------------------------------- tests -----
 
-def test_boot(esp, reset):
+def test_boot(esp, reset, expect_port):
     if not reset:
         record("BOOT", "SKIP", "--no-reset")
         return None
@@ -196,7 +198,7 @@ def test_boot(esp, reset):
         elif esp.mark() == start:
             record("BOOT", "FAIL", "no serial output - wrong COM port, or the board did not reset (press EN)")
         else:
-            record("BOOT", "FAIL", "no 'RFID reader on GPIO' line - is ROLE 0 and the new sketch flashed?")
+            record("BOOT", "FAIL", "no 'RFID reader on GPIO' line - is the new sketch flashed?")
         return None
 
     pin, baud, dest_ip, dest_port = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -204,6 +206,10 @@ def test_boot(esp, reset):
     if dest_ip not in mine:
         record("BOOT", "FAIL", f"cards go to {dest_ip}:{dest_port} but this PC is {', '.join(sorted(mine))} "
                                f"- set pcIP in the sketch or run this test on {dest_ip}")
+    elif int(dest_port) != expect_port:
+        role = {8891: "ROLE 0 (entrance)", 8892: "ROLE 1 (locker)"}.get(int(dest_port), "another role")
+        record("BOOT", "FAIL", f"the board is {role} and sends to port {dest_port}, but this test listens "
+                               f"on {expect_port} - add or drop --locker")
     else:
         record("BOOT", "PASS", f"reader on GPIO {pin} @ {baud} baud, cards to {dest_ip}:{dest_port}")
 
@@ -356,7 +362,9 @@ def main():
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--esp", default="192.168.1.120", help="ESP32 IP if not read from the boot log")
     parser.add_argument("--cmd-port", type=int, default=4210)
-    parser.add_argument("--rfid-port", type=int, default=8891, help="UDP_PORT_RFID")
+    parser.add_argument("--rfid-port", type=int, default=None,
+                        help="card port (default 8891 entrance, 8892 with --locker)")
+    parser.add_argument("--locker", action="store_true", help="test the locker ESP32 (ROLE 1)")
     parser.add_argument("--hold", type=int, default=6, help="seconds to hold the card in the HOLD test")
     parser.add_argument("--no-reset", action="store_true", help="do not reset the ESP32 (skips BOOT)")
     parser.add_argument("--no-serial", action="store_true", help="UDP only (COM port in use elsewhere)")
@@ -364,9 +372,14 @@ def main():
     parser.add_argument("--yes", action="store_true", help="do not ask about the ring colours")
     parser.add_argument("--monitor", action="store_true", help="print every card read until Ctrl+C")
     args = parser.parse_args()
+    if args.rfid_port is None:
+        args.rfid_port = 8892 if args.locker else 8891
+    if args.locker and args.esp == "192.168.1.120":
+        args.esp = "192.168.1.121"
 
     print("=" * 62)
-    print(f"RFID ESP32 test - serial {args.port}, cards on UDP :{args.rfid_port}")
+    print(f"RFID ESP32 test ({'locker' if args.locker else 'entrance'}) - serial {args.port}, "
+          f"cards on UDP :{args.rfid_port}")
     print("=" * 62)
 
     esp = None
@@ -392,7 +405,7 @@ def main():
 
         esp_ip = None
         if esp:
-            esp_ip = test_boot(esp, reset=not args.no_reset)
+            esp_ip = test_boot(esp, reset=not args.no_reset, expect_port=args.rfid_port)
         else:
             record("BOOT", "SKIP", "--no-serial")
         ring_ok = not any(name == "R503" and status != "PASS" for name, status, _ in RESULTS)

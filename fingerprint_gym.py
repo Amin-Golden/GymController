@@ -13,6 +13,7 @@ from datetime import datetime
 import threading
 import pickle
 import os
+import textwrap
 from fingerprint_processor_improved import ImprovedFingerprintProcessor, FAISS_AVAILABLE
 
 # NBIS engine (MINDTCT + BOZORTH3). Needs native binaries from NIST.
@@ -54,7 +55,35 @@ END_MARKER = b"FPIMGEND"
 
 # Fingerprint matching parameters
 FINGERS_PER_CLIENT = 2
-SAMPLES_PER_FINGER = 5
+
+# Presses per finger. Like a phone sensor, enrollment asks for each press at a
+# different part of the finger and stitches them into one whole-finger template
+# (fingerprint_local.fuse_presses), because one R503 press sees only ~8 mm.
+SAMPLES_PER_FINGER = int(os.environ.get("ENROLL_PRESSES", "8"))
+
+# If the database refuses all presses (an admin-app limit of 5 samples per
+# finger), enrollment retries with this many of the strongest presses.
+FALLBACK_STORED_PRESSES = 5
+
+# Characters per line on the entrance LCD / PC log. Longer enrollment messages
+# are wrapped onto extra lines instead of running off the screen.
+LCD_LINE_WIDTH = int(os.environ.get("LCD_LINE_WIDTH", "40"))
+
+# What to ask for on each press (cycled), shown on the entrance LCD - ASCII only.
+# Small shifts only: a press is stitched through the minutiae it shares with
+# earlier ones, and on enrollment day presses moved to the tip / joint / a
+# rolled edge mostly shared too few and were not stitched. Moving a few mm
+# keeps most of the window on known ridges while still adding new area.
+ENROLL_PROMPTS = [
+    "CENTER of the finger",
+    "CENTER again",
+    "move finger a LITTLE UP",
+    "move finger a LITTLE DOWN",
+    "move finger a LITTLE LEFT",
+    "move finger a LITTLE RIGHT",
+    "a little UP and LEFT",
+    "a little UP and RIGHT",
+]
 
 # Which matcher to use:
 #   "auto"  - NBIS if its binaries are installed, else the pure-Python minutiae
@@ -79,7 +108,7 @@ NBIS_FALLBACK_TO_SIFT = os.environ.get("NBIS_FALLBACK_TO_SIFT", "1") not in ("0"
 # literal only if that module failed to import.
 MIN_ENROLL_MINUTIAE = int(os.environ.get(
     "MIN_ENROLL_MINUTIAE",
-    str(fingerprint_local.MIN_ENROLL_MINUTIAE) if LOCAL_MODULE_AVAILABLE else "16"))
+    str(fingerprint_local.MIN_ENROLL_MINUTIAE) if LOCAL_MODULE_AVAILABLE else "10"))
 
 # Extra presses allowed while rejecting weak ones, before giving up.
 ENROLL_RETRY_BUDGET = int(os.environ.get("ENROLL_RETRY_BUDGET", "5"))
@@ -98,6 +127,91 @@ pc_ip = "192.168.1.3"            # PC
 pc_port = 4211
 raspi_entrance_ip = "192.168.1.111"
 raspi_entrance_port = 4210
+
+# --------------------------------------------------------------------------
+# Enrollment preview for the OrangePi screen
+# --------------------------------------------------------------------------
+# Each enrollment capture is drawn with its minutiae and the accept/reject
+# verdict, so a weak press (e.g. 15 minutiae against MIN_ENROLL_MINUTIAE) can
+# be seen. Enrollment runs on a worker thread and OpenCV windows belong to the
+# main thread, so this only stores the picture; RetinaFaceL's main loop shows it.
+
+PREVIEW_SCALE = 3
+_preview_lock = threading.Lock()
+_preview = None          # (sequence number, BGR image)
+_preview_seq = 0
+
+
+def _render_whole_finger(xyt, size):
+    """Square panel plotting the stitched whole-finger template, scaled to fit."""
+    panel = np.full((size, size, 3), 255, np.uint8)
+    pts = [tuple(map(float, l.split()[:3])) for l in (xyt or "").splitlines() if len(l.split()) >= 3]
+    cv2.putText(panel, f"Whole finger: {len(pts)} minutiae", (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 60, 0), 2)
+    if not pts:
+        return panel
+    xy = np.array([p[:2] for p in pts])
+    lo, span = xy.min(axis=0), max(np.ptp(xy, axis=0).max(), 1.0)
+    pad = 40
+    k = (size - 2 * pad) / span
+    for x, y, t in pts:
+        px, py = int(pad + (x - lo[0]) * k), int(pad + (y - lo[1]) * k)
+        th = np.radians(t)
+        cv2.circle(panel, (px, py), 5, (200, 90, 0), 2)
+        cv2.line(panel, (px, py), (int(px + 12 * np.cos(th)), int(py + 12 * np.sin(th))), (200, 90, 0), 2)
+    return panel
+
+
+def render_fingerprint_preview(image, title, xyt=None, verdict="", ok=True, whole_xyt=None):
+    """Fingerprint enlarged, minutiae marked, title and verdict above it.
+
+    With whole_xyt, the stitched whole-finger template is drawn beside it, so
+    coverage can be watched growing press by press.
+    """
+    s = PREVIEW_SCALE
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    big = cv2.resize(gray, (gray.shape[1] * s, gray.shape[0] * s), interpolation=cv2.INTER_CUBIC)
+    big = cv2.cvtColor(big, cv2.COLOR_GRAY2BGR)
+
+    color = (0, 200, 0) if ok else (0, 0, 255)          # BGR: green accepted, red rejected
+    for line in (xyt or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        x, y, theta = int(parts[0]) * s, int(parts[1]) * s, np.radians(float(parts[2]))
+        cv2.circle(big, (x, y), 2 * s, color, 2)
+        # direction in image coordinates (y grows downward), as both engines write it
+        end = (int(x + 5 * s * np.cos(theta)), int(y + 5 * s * np.sin(theta)))
+        cv2.line(big, (x, y), end, color, 2)
+
+    if whole_xyt is not None:
+        big = np.hstack([big, _render_whole_finger(whole_xyt, big.shape[0])])
+
+    header = np.full((70, big.shape[1], 3), 30, np.uint8)
+    cv2.putText(header, title, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    cv2.putText(header, verdict, (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+    return np.vstack([header, big])
+
+
+def publish_fingerprint_preview(image, title, xyt=None, verdict="", ok=True, whole_xyt=None):
+    """Render a capture for the main thread to show; never lets a drawing error stop enrollment."""
+    global _preview, _preview_seq
+    try:
+        picture = render_fingerprint_preview(image, title, xyt, verdict, ok, whole_xyt)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  Fingerprint preview failed: {e}")
+        return
+    with _preview_lock:
+        _preview_seq += 1
+        _preview = (_preview_seq, picture)
+
+
+def take_fingerprint_preview(last_seq=0):
+    """Return (sequence, image) when a capture newer than last_seq is waiting, else None."""
+    with _preview_lock:
+        if _preview is not None and _preview[0] != last_seq:
+            return _preview
+    return None
 
 # --------------------------------------------------------------------------
 # NBIS engine access (shared by every fingerprint system instance)
@@ -460,6 +574,26 @@ class DualESP32FingerprintSystem:
             self._pause_active = True
             return True
         return False
+
+    def _status(self, text, console=True):
+        """Show a message on the PC log and the entrance LCD, one display line per packet.
+
+        ASCII only, and wrapped at LCD_LINE_WIDTH so nothing runs off the screen.
+        console=False when the caller already printed its own (emoji) version.
+        """
+        if console:
+            print(f"   {text}")
+        lcd = text.encode("ascii", "ignore").decode()
+        for line in textwrap.wrap(lcd, LCD_LINE_WIDTH) or [""]:
+            for endpoint in ((pc_ip, pc_port), (raspi_entrance_ip, raspi_entrance_port)):
+                try:
+                    self.sock.sendto(line.encode("utf-8"), endpoint)
+                except Exception:
+                    pass
+
+    def _db_error(self):
+        """Why the last fingerprint save failed, as the database reported it."""
+        return getattr(self.db, "last_fingerprint_error", None) or "unknown database error (see the terminal)"
 
     def _release_pause(self):
         """Release main pipeline pause if previously acquired."""
@@ -855,10 +989,9 @@ class DualESP32FingerprintSystem:
             print(f"\n{'='*60}")
             print(f"🖐️ FINGERPRINT ENROLLMENT - Client ID: {client_id} - Finger {finger_index}")
             print(f"{'='*60}")
-            send_str = f"🖐️ FINGERPRINT ENROLLMENT - Client ID: {client_id} - Finger {finger_index}"
-            self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-            self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-            
+            self._status("FINGERPRINT ENROLLMENT", console=False)
+            self._status(f"Client {client_id} - Finger {finger_index}", console=False)
+
             # Get client info
             client_info = self.db.get_client_info(client_id)
             if not client_info:
@@ -869,12 +1002,8 @@ class DualESP32FingerprintSystem:
             print(f"👤 Enrolling: {name}")
             print(f"Using: {'ENTRANCE' if use_entrance_esp else 'LOCKER'} ESP32")
             print(f"Please scan {SAMPLES_PER_FINGER} fingerprint samples for finger {finger_index}...")
-            send_str = f"👤 Enrolling: {name}"
-            self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-            self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-            send_str = f"Please scan {SAMPLES_PER_FINGER} fingerprint samples for finger {finger_index}..."
-            self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-            self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+            self._status(f"Enrolling: {name}", console=False)
+            self._status(f"Finger {finger_index}: {SAMPLES_PER_FINGER} presses", console=False)
 
             receiver = self.entrance_receiver if use_entrance_esp else self.locker_receiver
             
@@ -883,13 +1012,18 @@ class DualESP32FingerprintSystem:
             
             samples = []
             retries_left = ENROLL_RETRY_BUDGET
+            # Whole-finger template stitched so far (pure-Python engine only: the
+            # stitching reads its .xyt layout). Shown on the LCD as it grows.
+            fusing = self.nbis_module is fingerprint_local if LOCAL_MODULE_AVAILABLE else False
+            whole = None
             while len(samples) < SAMPLES_PER_FINGER:
                 i = len(samples)
-                print(f"\n📌 Finger {finger_index} - Sample {i+1}/{SAMPLES_PER_FINGER}")
-                send_str = f"\n📌 Finger {finger_index} - Sample {i+1}/{SAMPLES_PER_FINGER}"
-                self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-                self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-                
+                prompt = ENROLL_PROMPTS[i % len(ENROLL_PROMPTS)]
+                print(f"\n📌 Finger {finger_index} - Press {i+1}/{SAMPLES_PER_FINGER}: {prompt}")
+                # The prompt gets its own line: together they do not fit the LCD
+                self._status(f"Finger {finger_index} - press {i+1}/{SAMPLES_PER_FINGER}", console=False)
+                self._status(prompt, console=False)
+
                 # Send status to ESP32
                 if self.sock:
                     try:
@@ -912,9 +1046,17 @@ class DualESP32FingerprintSystem:
                     client_id=client_id, finger_index=finger_index, sample_number=i + 1,
                     nbis_engine=self.nbis
                 )
-                
+                preview_title = (f"Client {client_id} - Finger {finger_index} - "
+                                 f"Press {i+1}/{SAMPLES_PER_FINGER}: {prompt}")
+                whole_xyt = fingerprint_local.minutiae_to_xyt(whole) if whole else None
+
                 if features is None:
                     print(f"✗ Failed to extract features from sample {i+1}")
+                    publish_fingerprint_preview(image, preview_title, None,
+                                                "REJECTED: no usable ridges - press again", ok=False,
+                                                whole_xyt=whole_xyt)
+                    self._status("Rejected: no usable ridges", console=False)
+                    self._status("Clean the finger, press again", console=False)
                     retries_left -= 1
                     if retries_left < 0:
                         print("✗ Too many unusable presses - aborting this finger")
@@ -926,14 +1068,14 @@ class DualESP32FingerprintSystem:
                 minutiae = features.get('minutiae_count')
                 if minutiae is not None and minutiae < MIN_ENROLL_MINUTIAE:
                     retries_left -= 1
-                    warn = (f"⚠️  Rejected: only {minutiae} minutiae (need "
+                    warn = (f"Rejected: only {minutiae} minutiae (need "
                             f"{MIN_ENROLL_MINUTIAE}) - press firmer and cover the whole window")
                     print(warn)
-                    try:
-                        self.sock.sendto(warn.encode("utf-8"), (pc_ip, pc_port))
-                        self.sock.sendto(warn.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-                    except Exception:
-                        pass
+                    publish_fingerprint_preview(image, preview_title, features.get('xyt'),
+                                                f"REJECTED: {minutiae} minutiae (need {MIN_ENROLL_MINUTIAE})",
+                                                ok=False, whole_xyt=whole_xyt)
+                    self._status(f"Rejected: {minutiae} minutiae (need {MIN_ENROLL_MINUTIAE})", console=False)
+                    self._status("Press firmer, cover the whole sensor", console=False)
                     if retries_left < 0:
                         print("✗ Could not get enough good presses - clean the sensor and retry")
                         return False
@@ -942,15 +1084,37 @@ class DualESP32FingerprintSystem:
                 samples.append(features)
                 quality = f", {minutiae} minutiae" if minutiae else ""
                 print(f"✓ Sample {i+1} captured ({features['num_features']} features{quality})")
-                send_str = f"✓ Sample {i+1} captured ({features['num_features']} features{quality})"
-                self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-                self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
-                
+
+                # Stitch this press onto the whole-finger template
+                stitch, note = "", None
+                if fusing and features.get('xyt'):
+                    press = fingerprint_local.parse_xyt(features['xyt'])
+                    if whole is None:
+                        whole, note = press, "first press"
+                    else:
+                        fused, info = fingerprint_local.fuse_minutiae(whole, press)
+                        if fused is not None:
+                            whole, note = fused, f"+{info['added']} new minutiae"
+                        else:
+                            note = "not stitched - move less next time"
+                    stitch = f", {note}, whole finger {len(whole)}"
+                    print(f"   🧩 Whole-finger template: {len(whole)} minutiae ({note})")
+                publish_fingerprint_preview(image, preview_title, features.get('xyt'),
+                                            (f"OK: {minutiae} minutiae" if minutiae
+                                             else "OK (no minutiae template, SIFT only)") + stitch,
+                                            whole_xyt=fingerprint_local.minutiae_to_xyt(whole) if whole else None)
+                # One short line each, so the LCD shows all of it
+                self._status(f"Press {i+1} OK: {minutiae or 0} minutiae", console=False)
+                if note:
+                    self._status(note[0].upper() + note[1:], console=False)
+                if whole:
+                    self._status(f"Whole finger: {len(whole)} minutiae", console=False)
+
                 if i < SAMPLES_PER_FINGER - 1:
-                    print("   Remove and place finger again...")
-                    send_str = " Remove and place finger again..."
-                    self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-                    self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+                    next_prompt = ENROLL_PROMPTS[(i + 1) % len(ENROLL_PROMPTS)]
+                    print(f"   Lift the finger. Next: {next_prompt}")
+                    self._status("Lift the finger", console=False)
+                    self._status(f"Next: {next_prompt}", console=False)
                     time.sleep(1)
             
             if len(samples) < SAMPLES_PER_FINGER:
@@ -959,22 +1123,55 @@ class DualESP32FingerprintSystem:
             
             # Save to database with finger_index
             success = self.db.save_fingerprint_features(client_id, finger_index, samples)
-            
+            stored = len(samples)
+            if not success:
+                self._status(f"Save failed: {self._db_error()}")
+                if len(samples) > FALLBACK_STORED_PRESSES:
+                    # The members database may allow only 5 samples per finger
+                    # (a sample_number limit from the admin app - see
+                    # migrate_fingerprint_presses.sql). Keep the strongest presses
+                    # so the member is enrolled now; the whole-finger template
+                    # below is still stitched from ALL presses.
+                    best = sorted(samples, key=lambda s: s.get('minutiae_count') or 0,
+                                  reverse=True)[:FALLBACK_STORED_PRESSES]
+                    success = self.db.save_fingerprint_features(client_id, finger_index, best)
+                    stored = len(best)
+                    if success:
+                        self._status(f"Saved the best {FALLBACK_STORED_PRESSES} presses - run "
+                                     f"migrate_fingerprint_presses.sql to keep all {len(samples)}")
+                    else:
+                        self._status(f"Save failed again: {self._db_error()}")
+
+            if success and fusing:
+                # Re-stitch all presses in the best order (a press that did not fit
+                # early can fit once its neighbours are in) and store the result
+                # as one more template for this finger.
+                fused, used = fingerprint_local.fuse_presses(
+                    [fingerprint_local.parse_xyt(s['xyt']) for s in samples if s.get('xyt')])
+                if fused is not None:
+                    if self.db.save_fused_template(client_id, finger_index,
+                                                   fingerprint_local.minutiae_to_xyt(fused), len(fused)):
+                        print(f"🧩 Whole finger: {len(fused)} minutiae from {len(used)} presses")
+                        self._status(f"Whole finger: {len(fused)} minutiae from {len(used)} presses")
+                    else:
+                        # The finger is still enrolled with its separate presses
+                        self._status(f"Whole-finger template not saved: {self._db_error()}")
+                else:
+                    print("⚠️  Presses did not overlap enough to build a whole-finger template "
+                          "- the finger is still enrolled with its separate presses")
+
             if success:
                 # Both matchers cache enrolled data - make them pick up the new finger
                 nbis_invalidate_gallery()
                 self.processor.faiss_index = None
                 self.processor.cache_valid = False
-                print(f"✅ Saved {SAMPLES_PER_FINGER} samples for finger {finger_index}")
-                send_str = f"✅ Saved {SAMPLES_PER_FINGER} samples for finger {finger_index}"
-                self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-                self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+                print(f"✅ Saved {stored} samples for finger {finger_index}")
+                self._status(f"Saved {stored} samples for finger {finger_index}", console=False)
                 # Send success to ESP32
                 if self.sock:
                     try:
                         sendstr = f"Success Finger {finger_index}"
                         self.sock.sendto(sendstr.encode("utf-8"), (esp_ip, esp_port))
-                        self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
                     except Exception:
                         pass
                 
@@ -985,9 +1182,7 @@ class DualESP32FingerprintSystem:
                         # Update registered fingerprints from cache
                         self.registered_fingerprints = self.fingerprint_cache.get_fingerprints()
                         print(f"✅ Fingerprint cache updated in fingerprint system")
-                        send_str = f"✅ Fingerprint cache updated in fingerprint system"
-                        self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-                        self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
+                        self._status("Fingerprint cache updated", console=False)
 
                 # Update local cache without reloading all clients when cache is not available
                 if not self.fingerprint_cache:
@@ -1023,7 +1218,7 @@ class DualESP32FingerprintSystem:
             all_ok = all_ok and ok
             if not ok:
                 print(f"⚠️  Finger {finger_index} enrollment failed")
-                send_str = f"⚠️  Finger {finger_index} enrollment failed"
+                send_str = f"Finger {finger_index} enrollment failed"
                 self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
                 self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
         return all_ok
@@ -1086,7 +1281,7 @@ class FingerprintGymSystem:
         print(f"\n{'='*60}")
         print(f"🖐️ FINGERPRINT ENROLLMENT - Client ID: {client_id}")
         print(f"{'='*60}")
-        send_str = f"🖐️ FINGERPRINT ENROLLMENT - Client ID: {client_id}"
+        send_str = f"FINGERPRINT ENROLLMENT - Client ID: {client_id}"
         self.sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
         self.sock.sendto(send_str.encode("utf-8"), (raspi_entrance_ip, raspi_entrance_port))
         

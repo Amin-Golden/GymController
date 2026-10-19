@@ -28,7 +28,7 @@
   UpImage delivers it 4-bit packed (2 px/byte); some clone modules send
   8-bit - both are handled.
   ------------------------------------------------------------------
-  Wiring (serial RFID reader, entrance role only):
+  Wiring (serial RFID reader, same on the entrance and locker units):
     reader TX      -> GPIO 25  (RFID_RX_PIN)
     reader RX      -> GPIO 26  (RFID_TX_PIN, only if the reader needs commands)
     reader VCC/GND -> 5V / GND (or 3.3V if the module allows it)
@@ -37,7 +37,8 @@
   divider on it (e.g. 1k from TX to GPIO 25, 2k from GPIO 25 to GND).
 
   Each card shown is sent to the PC once as "RFID:<uid>" on UDP 8891
-  (rfid_gym.py). Both RDM6300 frames (STX + 10 hex ID + 2 hex checksum +
+  (entrance: check in/out) or 8892 (locker: open the member's locker),
+  see rfid_gym.py. Both RDM6300 frames (STX + 10 hex ID + 2 hex checksum +
   ETX) and plain-text readers (ID followed by CR/LF) are understood.
   ------------------------------------------------------------------
 */
@@ -50,10 +51,10 @@
 #define ROLE 0
 
 // ---------------------------------------------------------------- network --
-const char* ssid     = "Autoro";
-const char* password = "#Autoro@2027";
+const char* ssid     = "HOME";
+const char* password = "amin% 1993";
 
-const char* pcIP = "192.168.1.4";       // PC running fingerprint_gym.py
+const char* pcIP = "192.168.1.100";       // PC running fingerprint_gym.py
 #if ROLE == 0
 const int   imagePort = 8889;             // UDP_PORT_ENTRANCE
 IPAddress   local_IP(192, 168, 1, 120);   // ENTRANCE_ESP_IP
@@ -81,13 +82,19 @@ WiFiUDP udp;
 // Serial RFID reader on the second UART. Readers repeat the ID for as long as
 // the card stays in the field; one presentation must count as one read, so
 // the same card is ignored until it has been away for RFID_REPEAT_MS.
-#define RFID_ENABLED    (ROLE == 0)
+// The PC tells the two readers apart by port: entrance cards check in/out,
+// locker cards open the member's locker.
+#define RFID_ENABLED    1      // 0 = no reader fitted on this unit
 #define RFID_RX_PIN     25     // ESP32 receives here <- reader TX
 #define RFID_TX_PIN     26     // ESP32 transmits here -> reader RX
 #define RFID_BAUD       9600   // RDM6300 and most UART readers
 #define RFID_REPEAT_MS  3000
 #define RFID_IDLE_MS    60     // flush an unterminated ID after this much silence
-const int rfidPort = 8891;     // UDP_PORT_RFID on the PC
+#if ROLE == 0
+const int rfidPort = 8891;     // UDP_PORT_RFID_ENTRANCE on the PC
+#else
+const int rfidPort = 8892;     // UDP_PORT_RFID_LOCKER on the PC
+#endif
 
 // Blank-frame gate: a real fingerprint has contrast; an empty/backlit window is
 // nearly uniform. Frames with a pixel std-dev below this are not sent. The

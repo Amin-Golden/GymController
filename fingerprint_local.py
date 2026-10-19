@@ -87,7 +87,12 @@ LOCAL_MATCH_THRESHOLD = int(os.environ.get("LOCAL_MATCH_THRESHOLD", "6"))
 # weak finger is still worth doing, but is not by itself a fix. A finger that
 # consistently can't clear this within ENROLL_RETRY_BUDGET presses (in
 # fingerprint_gym.py) is one this sensor genuinely cannot capture well.
-MIN_ENROLL_MINUTIAE = int(os.environ.get("MIN_ENROLL_MINUTIAE", "16"))
+# Lowered to 10 on 2026-10 with multi-press enrollment: presses are now
+# stitched into one whole-finger template (fuse_presses), so a press that only
+# shows a smooth part of the finger - genuinely few minutiae, e.g. the core -
+# still adds coverage instead of being rejected. 160x160 R503 presses measure
+# 12-57 minutiae (median 18) on the labelled dataset.
+MIN_ENROLL_MINUTIAE = int(os.environ.get("MIN_ENROLL_MINUTIAE", "10"))
 
 # The winner must beat the runner-up client by this ratio (1.0 disables).
 LOCAL_MATCH_MARGIN = float(os.environ.get("LOCAL_MATCH_MARGIN", "1.25"))
@@ -502,20 +507,24 @@ def match_templates(t1, t2, dist_tol: float = LOCAL_DIST_TOL, dist_rel: float = 
     consistency is always checked against real nearby structure - never one
     rigid transform assumed to explain every minutia in the image at once.
     """
+    return len(match_pairs(t1, t2, dist_tol, dist_rel, ang_tol_deg, root_candidates))
+
+
+def match_pairs(t1, t2, dist_tol: float = LOCAL_DIST_TOL, dist_rel: float = 0.08,
+                ang_tol_deg: float = LOCAL_ANG_TOL_DEG,
+                root_candidates: int = 12) -> Dict[int, int]:
+    """The correspondence behind match_templates(): {minutia in t1: minutia in t2}."""
     if t1 is None or t2 is None:
-        return 0
+        return {}
     ang_tol = np.radians(ang_tol_deg)
     tol = dict(dist_tol=dist_tol, dist_rel=dist_rel, ang_tol=ang_tol)
 
     roots = _root_candidates(t1, t2, dist_tol, dist_rel, ang_tol, top=root_candidates)
-    if not roots:
-        return 0
-
-    best = 0
+    best = {}
     for ri, rj in roots:
-        n = _grow(ri, rj, t1, t2, tol)
-        if n > best:
-            best = n
+        matched = _grow(ri, rj, t1, t2, tol)
+        if len(matched) > len(best):
+            best = matched
     return best
 
 
@@ -550,7 +559,141 @@ def _grow(root_i, root_j, t1, t2, tol):
             used2.add(b2)
             queue.append(b)
 
-    return len(matched)
+    return matched
+
+
+# ==========================================================================
+# Multi-press fusion ("move your finger around", as phone sensors enroll)
+# ==========================================================================
+# The R503 sees only ~8 mm of finger per press, ~10-20 minutiae. A live press
+# can land anywhere on the finger, so it often shares too few minutiae with any
+# single enrolled press. Enrollment therefore asks for presses at different
+# positions and stitches them into one template covering the whole finger:
+# each press is aligned onto the template through the minutiae it shares with
+# it (rotation + shift), then its new minutiae are added.
+
+# Shared minutiae needed to place a press onto the template. Fewer than this
+# and the alignment could be a coincidence - the press stays a separate sample.
+FUSE_MIN_PAIRS = int(os.environ.get("FUSE_MIN_PAIRS", "5"))
+
+# Max RMS alignment error (px) for the shared minutiae; above it the press is
+# not stitched (one ridge period is ~8 px at 508 dpi).
+FUSE_MAX_RMS = float(os.environ.get("FUSE_MAX_RMS", "6.0"))
+
+# A stitched minutia this close to an existing one, pointing the same way, is
+# the same feature seen again: it is merged, not added twice.
+FUSE_MERGE_DIST = float(os.environ.get("FUSE_MERGE_DIST", "8.0"))
+FUSE_MERGE_ANGLE_DEG = float(os.environ.get("FUSE_MERGE_ANGLE_DEG", "30.0"))
+
+
+def _rigid_fit(src: np.ndarray, dst: np.ndarray):
+    """Least-squares rotation + shift taking src points onto dst (2-D Kabsch)."""
+    cs, cd = src.mean(axis=0), dst.mean(axis=0)
+    h = (src - cs).T @ (dst - cd)
+    angle = np.arctan2(h[0, 1] - h[1, 0], h[0, 0] + h[1, 1])
+    rot = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    shift = cd - rot @ cs
+    return angle, rot, shift
+
+
+def align_minutiae(new, base, min_pairs: int = FUSE_MIN_PAIRS, max_rms: float = FUSE_MAX_RMS):
+    """Rotation/shift placing `new` minutiae onto `base`, or None if they don't overlap enough.
+
+    Returns (angle, rot, shift, pairs_used, rms). Pairs that disagree with the
+    fitted alignment are dropped and the fit repeated, so one wrong
+    correspondence from the matcher cannot skew the whole placement.
+    """
+    pairs = match_pairs(build_template(new), build_template(base))
+    if len(pairs) < min_pairs:
+        return None
+    src = np.array([new[i][:2] for i in pairs], float)
+    dst = np.array([base[j][:2] for j in pairs.values()], float)
+
+    keep = np.ones(len(src), bool)
+    for _ in range(3):
+        if keep.sum() < min_pairs:
+            return None
+        angle, rot, shift = _rigid_fit(src[keep], dst[keep])
+        err = np.hypot(*((src @ rot.T + shift) - dst).T)
+        new_keep = err <= max(2.0 * np.median(err[keep]), max_rms)
+        if (new_keep == keep).all():
+            break
+        keep = new_keep
+    if keep.sum() < min_pairs:
+        return None
+    rms = float(np.sqrt(np.mean(err[keep] ** 2)))
+    if rms > max_rms:
+        return None
+    return angle, rot, shift, int(keep.sum()), rms
+
+
+def fuse_minutiae(base, new, merge_dist: float = FUSE_MERGE_DIST,
+                  merge_angle_deg: float = FUSE_MERGE_ANGLE_DEG):
+    """Stitch `new` onto `base`. Returns (fused minutiae, info) or (None, None) if it can't be placed.
+
+    info = {"pairs", "rms", "added"}: shared minutiae used for the alignment,
+    its error in px, and how many minutiae the press contributed that the
+    template did not have yet (0 = this part of the finger was already covered).
+    """
+    placed = align_minutiae(new, base)
+    if placed is None:
+        return None, None
+    angle, rot, shift, pairs, rms = placed
+
+    merge_ang = np.radians(merge_angle_deg)
+    fused = list(base)
+    base_xy = np.array([m[:2] for m in base], float)
+    base_th = np.array([m[2] for m in base], float)
+    added = 0
+    for x, y, th, kind, q in new:
+        nx, ny = rot @ np.array([x, y], float) + shift
+        nth = float(np.mod(th + angle, 2 * np.pi))
+        d = np.hypot(base_xy[:, 0] - nx, base_xy[:, 1] - ny)
+        same = (d <= merge_dist) & (np.abs(_wrap(base_th - nth)) <= merge_ang)
+        if same.any():
+            continue                     # already in the template
+        fused.append((float(nx), float(ny), nth, kind, q))
+        added += 1
+
+    # Keep coordinates non-negative: matching is shift-invariant, but .xyt
+    # consumers and the LCD preview expect image-like coordinates.
+    min_x = min(m[0] for m in fused)
+    min_y = min(m[1] for m in fused)
+    if min_x < 0 or min_y < 0:
+        dx, dy = max(0.0, -min_x), max(0.0, -min_y)
+        fused = [(mx + dx, my + dy, mt, mk, mq) for mx, my, mt, mk, mq in fused]
+    return fused, {"pairs": pairs, "rms": rms, "added": added}
+
+
+def fuse_presses(press_minutiae: Sequence[Sequence], min_presses: int = 2):
+    """Stitch several presses of one finger into one whole-finger template.
+
+    Starts from the press with the most minutiae and keeps adding whichever
+    remaining press aligns onto the growing template with the most shared
+    minutiae. Returns (fused minutiae, indices of the presses used); presses
+    that never overlap enough are left out (they stay separate samples).
+    Returns (None, []) when fewer than `min_presses` could be stitched.
+    """
+    presses = [list(p) for p in press_minutiae if p]
+    if len(presses) < min_presses:
+        return None, []
+    start = max(range(len(presses)), key=lambda i: len(presses[i]))
+    fused, used = presses[start], [start]
+    remaining = [i for i in range(len(presses)) if i != start]
+    while remaining:
+        best = None
+        for i in remaining:
+            placed = align_minutiae(presses[i], fused)
+            if placed is not None and (best is None or placed[3] > best[1]):
+                best = (i, placed[3])
+        if best is None:
+            break
+        fused, _info = fuse_minutiae(fused, presses[best[0]])
+        used.append(best[0])
+        remaining.remove(best[0])
+    if len(used) < min_presses:
+        return None, []
+    return fused, used
 
 
 # ==========================================================================

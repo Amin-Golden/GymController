@@ -15,8 +15,9 @@ import socket
 import threading
 from queue import Queue
 import traceback
-from fingerprint_gym import DualESP32FingerprintSystem
-from rfid_gym import RFIDEntranceSystem
+from fingerprint_gym import DualESP32FingerprintSystem, take_fingerprint_preview, LCD_LINE_WIDTH
+import textwrap
+from rfid_gym import RFIDCardSystem
 
 HEADLESS = os.environ.get('DISPLAY') is None
 
@@ -78,6 +79,18 @@ def resume_main_processing():
     if processing_pause_event.is_set():
         processing_pause_event.clear()
         print("▶️ Resuming main processing")
+
+
+last_fingerprint_preview = 0
+
+def show_fingerprint_preview():
+    """Show the newest enrollment capture (minutiae marked) - main thread only, like all cv2 windows."""
+    global last_fingerprint_preview
+    preview = take_fingerprint_preview(last_fingerprint_preview)
+    if preview is not None:
+        last_fingerprint_preview, picture = preview
+        cv2.namedWindow("Fingerprint", cv2.WINDOW_AUTOSIZE)
+        cv2.imshow("Fingerprint", picture)
 
 class BiometricCache:
     """Manages in-memory cache for face embeddings and fingerprint features"""
@@ -640,11 +653,13 @@ class FingerprintEnrollmentProcessor:
     def _send_status(self, message):
         if not self.sock or not self.status_endpoints:
             return
-        for endpoint in self.status_endpoints:
-            try:
-                self.sock.sendto(message.encode("utf-8"), endpoint)
-            except Exception as send_err:
-                print(f"⚠️ Unable to send status message: {send_err}")
+        # One packet per display line, so long messages are not cut off on the LCD
+        for line in textwrap.wrap(message, LCD_LINE_WIDTH) or [""]:
+            for endpoint in self.status_endpoints:
+                try:
+                    self.sock.sendto(line.encode("utf-8"), endpoint)
+                except Exception as send_err:
+                    print(f"⚠️ Unable to send status message: {send_err}")
 
     def _fetch_client_name(self, client_id):
         try:
@@ -672,7 +687,7 @@ class FingerprintEnrollmentProcessor:
 
             try:
                 display_name = self._fetch_client_name(client_id) or f"Client {client_id}"
-                entry_message = f"🖐️ Fingerprint enrollment requested for {display_name} ({finger_label}, {device_label}) via {source}"
+                entry_message = f"Fingerprint enrollment requested for {display_name} ({finger_label}, {device_label}) via {source}"
                 print(entry_message)
                 self._send_status(entry_message)
 
@@ -683,7 +698,7 @@ class FingerprintEnrollmentProcessor:
                 )
 
                 if success:
-                    success_msg = f"✅ Fingerprint enrollment completed for {display_name}"
+                    success_msg = f"Fingerprint enrollment completed for {display_name}"
                     print(success_msg)
                     self._send_status(success_msg)
                     if self.biometric_cache:
@@ -692,7 +707,7 @@ class FingerprintEnrollmentProcessor:
                         registered_fingerprints_cache[:] = self.biometric_cache.get_fingerprints()
                         print("✅ Updated global fingerprint cache")
                 else:
-                    warn_msg = f"⚠️ Fingerprint enrollment failed for {display_name}"
+                    warn_msg = f"Fingerprint enrollment failed for {display_name}"
                     print(warn_msg)
                     self._send_status(warn_msg)
             except Exception as e:
@@ -701,6 +716,9 @@ class FingerprintEnrollmentProcessor:
             finally:
                 with self.lock:
                     self.pending.discard(key)
+                # The member is standing at the entrance camera when enrollment
+                # ends; without this the face loop resumes and checks them in/out.
+                update_entrance_cooldown(client_id)
         print("🛑 Fingerprint enrollment processor stopped")
 
 class AsyncRTSPReader:
@@ -779,6 +797,10 @@ class AsyncRTSPReader:
 last_entrance_time = {}  # Track last entrance/exit time per client (shared by both systems)
 entrance_cooldown = 60  # 1 minute cooldown (shared)
 entrance_lock = threading.Lock()  # one entrance decision at a time
+
+# Locker unlock cooldown (locker camera, locker fingerprint and locker card)
+last_locker_unlock = {}  # Track last unlock time per locker
+locker_unlock_cooldown = 10  # seconds between unlocks for same locker
 
 def check_entrance_cooldown(client_id, client_name):
     """
@@ -926,72 +948,68 @@ def on_entrance_fingerprint(client_id, client_name, confidence):
 
 def on_entrance_card(client_id, client_name, confidence):
     """Entrance RFID reader callback"""
-    if client_id is not None:
-        handle_entrance(client_id, client_name, "card")
+    return handle_entrance(client_id, client_name, "card")
 
-def on_locker_fingerprint(client_id, client_name, confidence):
+def handle_locker(client_id, client_name, confidence, source):
     """
-    Callback function called when fingerprint is automatically identified
-    
-    Args:
-        client_id: Client database ID (None if no match)
-        client_name: Client name (None if no match)
-        confidence: Match confidence score (0-1)
+    Open the member's own locker - one flow for the locker-room fingerprint and RFID card.
+    Returns True when the unlock command was sent.
     """
-    global sock, raspi_locker_ip, raspi_locker_port, esp32_1_ip, esp32_1_port, esp32_2_ip, esp32_2_port, pc_ip, pc_port
-    global last_locker_unlock, locker_unlock_cooldown
-    
-    if client_id is None:
-        # No match found
-        print("❌ Unknown fingerprint - Access DENIED")
-        return
-    
-    print(f"\n🖐️ Fingerprint Match: {client_name} (ID: {client_id})")
-    
-    # Get client info
+    print(f"\n🔐 Locker access: {client_name} (ID: {client_id}) via {source}")
+
     client_info = get_client_info_cached(client_id)
-    
     if not client_info:
         print(f"❌ Client info not found for {client_id}")
-        return
-    
+        return False
+
     # Check if client has a locker assigned
     if client_info['locker'] is None:
         print(f"⚠️  {client_name} has no locker assigned")
-        return
-    
+        return False
+
     locker_number = client_info['locker'] + 1
     current_time = time.time()
-    
+
     # Check cooldown to prevent rapid unlocks
     if locker_number in last_locker_unlock:
         time_since_last = current_time - last_locker_unlock[locker_number]
         if time_since_last < locker_unlock_cooldown:
             remaining = int(locker_unlock_cooldown - time_since_last)
             print(f"⏳ Locker {locker_number} cooldown: {remaining}s remaining")
-            return
-    
-    # Send unlock command to appropriate ESP32
+            return False
+
     try:
-        open_locker(locker_number)
+        if not open_locker(locker_number):
+            return False
 
         # Also send to Raspberry Pi
         sock.sendto(str(locker_number).encode("utf-8"), (raspi_locker_ip, raspi_locker_port))
         send_str = "Locker " + str(locker_number) + " unlocked"
         sock.sendto(send_str.encode("utf-8"), (pc_ip, pc_port))
-        
-        # Update last unlock time
+
         last_locker_unlock[locker_number] = current_time
-        
-        print(f"✅ Locker {locker_number} unlocked via FINGERPRINT")
+
+        print(f"✅ Locker {locker_number} unlocked via {source.upper()}")
         print(f"   Client: {client_name}")
         print(f"   Confidence: {confidence*100:.1f}%")
-        
-        # Log access
+
         db.log_access(client_id, True, float(confidence))
-        
+        return True
+
     except Exception as e:
         print(f"❌ Error unlocking locker: {e}")
+        return False
+
+def on_locker_fingerprint(client_id, client_name, confidence):
+    """Locker-room fingerprint reader callback (client_id None = no match)"""
+    if client_id is None:
+        print("❌ Unknown fingerprint - Access DENIED")
+        return
+    handle_locker(client_id, client_name, confidence, "fingerprint")
+
+def on_locker_card(client_id, client_name, confidence):
+    """Locker-room RFID reader callback"""
+    return handle_locker(client_id, client_name, confidence, "card")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RetinaFace Python Demo', add_help=True)
@@ -1227,9 +1245,11 @@ if __name__ == '__main__':
         # Start fingerprint auto-identification
         fingerprint_system.start_auto_identification()
 
-        # RFID cards at the entrance run the same entry/exit flow as face and fingerprint
-        rfid_system = RFIDEntranceSystem(db, on_entrance_card, sock=sock,
-                                         status_endpoints=status_endpoints)
+        # RFID cards: at the entrance they check in/out like face and fingerprint,
+        # in the locker room they open the member's locker like the locker fingerprint
+        rfid_system = RFIDCardSystem(db, entrance_callback=on_entrance_card,
+                                     locker_callback=on_locker_card, sock=sock,
+                                     status_endpoints=status_endpoints)
         db.register_notification_handler('RFID_ENROLL', rfid_system.handle_notification)
         rfid_system.start()
 
@@ -1705,9 +1725,6 @@ if __name__ == '__main__':
         # amin1 = rknnFace.inference(inputs=[fame_imag])[0][0]
         # simi = Similarity(amin,amin1)
         # print("amin ==============" , simi)
-            # Locker unlock cooldown tracking (ADD THIS BEFORE WHILE LOOP)
-        last_locker_unlock = {}  # Track last unlock time per locker
-        locker_unlock_cooldown = 10  # seconds between unlocks for same locker
         frame_count = 0
         consecutive_errors = 0
         max_consecutive_errors = 5
@@ -1720,6 +1737,7 @@ if __name__ == '__main__':
 
                 if processing_pause_event.is_set():
                     if not HEADLESS:
+                        show_fingerprint_preview()
                         key = cv2.waitKey(10) & 0xFF
                         if key == ord('q'):
                             print("Exit requested by user.")
@@ -1754,6 +1772,7 @@ if __name__ == '__main__':
                     if usb_img is not None:
                         cv2.namedWindow("USB CAM", cv2.WINDOW_FULLSCREEN)
                         cv2.imshow("USB CAM", usb_img)
+                    show_fingerprint_preview()
 
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
