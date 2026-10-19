@@ -14,8 +14,6 @@ from db_helper import DatabaseHelper
 import socket
 import threading
 from queue import Queue
-import ctypes
-from ctypes import *
 import traceback
 from fingerprint_gym import DualESP32FingerprintSystem
 from rfid_gym import RFIDEntranceSystem
@@ -705,42 +703,6 @@ class FingerprintEnrollmentProcessor:
                     self.pending.discard(key)
         print("🛑 Fingerprint enrollment processor stopped")
 
-def ps3camLoad():
-    # Load library
-    try:
-        lib = ctypes.CDLL('/usr/local/lib/libps3eye_wrapper.so')
-    except Exception as e:
-        print(f"❌ Failed to load library: {e}")
-        print("Run: ./use_cpp_wrapper_fixed.sh")
-        sys.exit(1)
-
-    # Define function signatures
-    lib.ps3eye_init.restype = c_int
-    lib.ps3eye_start.argtypes = [c_int, c_int, c_int]
-    lib.ps3eye_start.restype = c_int
-    lib.ps3eye_get_frame.argtypes = [POINTER(c_ubyte)]
-    lib.ps3eye_get_frame.restype = c_int
-    lib.ps3eye_stop.restype = None
-    lib.ps3eye_set_gain.argtypes = [c_int]
-    lib.ps3eye_set_exposure.argtypes = [c_int]
-    lib.ps3eye_set_autogain.argtypes = [c_int]
-
-    # Initialize
-    print("Initializing camera...")
-    if lib.ps3eye_init() == 0:
-        print("❌ No usb camera found!")
-        sys.exit(1)
-    print("✓ Camera detected")
-
-    # Start camera
-    width, height, fps = 640, 480, 30
-    if lib.ps3eye_start(width, height, fps) == 0:
-        print("❌ Failed to start camera!")
-        sys.exit(1)
-    lib.ps3eye_set_exposure(200)
-
-    return lib 
-
 class AsyncRTSPReader:
     """Asynchronously pulls frames from an RTSP stream using a background thread."""
 
@@ -1392,12 +1354,6 @@ if __name__ == '__main__':
         locker_reader.start()
 
 
-        # Set up USB camera for locker assignment
-        # print("📷 Initializing USB camera...")
-        # buffer_size = 640 * 480 * 3
-        # buffer = (c_ubyte * buffer_size)()
-
-        # ps3Cap = ps3camLoad()
         img_width = 640
         img_height = 480
         model_height, model_width = (320, 320)

@@ -1,6 +1,9 @@
 # Model files (too large for GitHub)
 model/*.rknn
-model/retinafacefp copy.rknn
+
+# Python bytecode
+__pycache__/
+*.pyc
 
 # Biometric data - never commit fingerprint captures or generated templates
 fingerprint_storage/images/enrolled/

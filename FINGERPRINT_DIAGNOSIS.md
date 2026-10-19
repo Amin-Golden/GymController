@@ -1,8 +1,7 @@
 # Fingerprint recognition: diagnosis and the way forward
 
-This supersedes `FINGERPRINT_ALGORITHM_ANALYSIS.md`, `FINGERPRINT_SOLUTION_SUMMARY.md`
-and `EMBEDDING_MIGRATION_COMPLETE.md`, which describe the SIFT/FAISS/embedding
-design that measurement has now ruled out.
+This supersedes the earlier SIFT/FAISS/embedding design documents (removed from
+the repo; see git history), which measurement has now ruled out.
 
 ---
 
