@@ -3,6 +3,21 @@
 This supersedes the earlier SIFT/FAISS/embedding design documents (removed from
 the repo; see git history), which measurement has now ruled out.
 
+> **Current engine (2026-10-20): grayscale SIFT with geometric verification -
+> see `FINGERPRINT_ENGINE.md`.** On a two-session test it beat every approach
+> below, including the decoded sensor template. Everything after this box is
+> the history of how it got there.
+>
+> **Update 2026-10-19 - the sensor's own template is decoded.** The R503's
+> template format is now decoded in `r503_template.py`: x, y, direction, type,
+> quality, a per-minutia descriptor and a block orientation map. That module
+> also matches the templates on the PC/OrangePi. The sensor extracts these
+> minutiae before its enhancement, so the PC no longer matches the skeleton
+> image. Tools, measurements and sensor quirks (no template before `RegModel`;
+> `Match` ignores `DownChar(1)`) are in `test/r503_template_lab.py` and the
+> module docstrings. Sections 1b-1c and Option B2 below describe the earlier
+> state.
+
 ---
 
 ## 1. Verdict
@@ -109,6 +124,17 @@ unattended access control** - this is stated plainly, not as a caveat to
 skim past.
 
 ## 1c. "Shouldn't the fingerprint image be in grayscale?"
+
+> **Correction (2026-10-19), measured with `test/capture_template_pairs.py`:**
+> the sensor does *not* binarise at capture time. `finger_UDP.ino` calls
+> `Img2Tz` before `UpImage`, and `Img2Tz` overwrites the image buffer with its
+> own ridge skeleton. Uploaded before `Img2Tz`, all 25 test presses are real
+> 16-level grayscale (160x160); uploaded after, all 25 have 2 levels. The rest of
+> this section explains the two-valued captures correctly but blames the wrong
+> stage. Grayscale is therefore available, but `fingerprint_local.py` does not
+> yet beat the sensor's skeleton with it (5 fingers x 5 presses: d' 0.81 /
+> rank-1 64% on grayscale vs d' 1.61 / 96% on the skeleton), so the normal
+> capture path is unchanged.
 
 Yes, ideally - and the honest answer is that it already isn't, upstream of
 anything this project's code does. Check any capture directly:

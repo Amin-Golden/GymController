@@ -1466,16 +1466,19 @@ class DatabaseHelper:
                 SELECT column_name FROM information_schema.columns
                 WHERE table_name = 'fingerprint_features'
                   AND column_name IN ('embedding', 'xyt_template', 'image_path',
-                                      'minutiae_count', 'nbis_updated_at')
+                                      'minutiae_count', 'nbis_updated_at', 'sift_gray',
+                                      'sensor_template')
             """)
             found = {row[0] for row in cursor.fetchall()}
             cursor.close()
             DatabaseHelper._fingerprint_columns = found
 
-            missing = {'xyt_template', 'image_path'} - found
-            if missing:
-                print(f"⚠️  fingerprint_features is missing {sorted(missing)} - "
-                      "run migrate_fingerprint_nbis.sql to enable the NBIS engine")
+            if 'sift_gray' not in found:
+                print("⚠️  fingerprint_features has no sift_gray column - run "
+                      "migrate_fingerprint_sift_gray.sql before enrolling fingerprints")
+            elif 'sensor_template' not in found:
+                print("⚠️  fingerprint_features has no sensor_template column - run "
+                      "migrate_fingerprint_sift_gray.sql again to enable the sensor double-check")
         except Exception as e:
             print(f"⚠️  Could not inspect fingerprint_features columns: {e}")
         finally:
@@ -1533,9 +1536,19 @@ class DatabaseHelper:
                 confidence = features.get('confidence', 1.0)
                 xyt = features.get('xyt')
                 image_path = features.get('image_path')
+                sift_gray = features.get('sift_gray')   # grayscale engine (fingerprint_sift.pack)
 
-                # A sample is worth keeping if either engine produced something.
-                if num_features == 0 and not xyt:
+                if sift_gray:
+                    if 'sift_gray' not in optional:
+                        self.last_fingerprint_error = ("database has no sift_gray column - "
+                                                       "run migrate_fingerprint_sift_gray.sql")
+                        print(f"❌ {self.last_fingerprint_error}")
+                        connection.rollback()
+                        return False
+                    num_features = int(features.get('num_features') or 0)
+
+                # A sample is worth keeping if any engine produced something.
+                if num_features == 0 and not xyt and not sift_gray:
                     print(f"⚠️  Skipping sample {idx} - no descriptors and no NBIS template")
                     continue
                 if num_features == 0 and 'xyt_template' not in optional:
@@ -1578,6 +1591,14 @@ class DatabaseHelper:
                     columns.append('image_path')
                     values.append(str(image_path))
 
+                if sift_gray:
+                    columns.append('sift_gray')
+                    values.append(psycopg2.Binary(bytes(sift_gray)))
+                # R503 template for the sensor double-check - optional, never blocks a save
+                if features.get('sensor_template') and 'sensor_template' in optional:
+                    columns.append('sensor_template')
+                    values.append(psycopg2.Binary(bytes(features['sensor_template'])))
+
                 columns.append('updated_at')
                 values.append(datetime.now())
 
@@ -1586,6 +1607,10 @@ class DatabaseHelper:
                 cursor.execute(query, tuple(values))
 
                 extras = []
+                if sift_gray:
+                    extras.append(f"{len(sift_gray) // 1024} KB grayscale features")
+                if features.get('sensor_template') and 'sensor_template' in optional:
+                    extras.append("sensor template")
                 if xyt:
                     extras.append(f"{features.get('minutiae_count') or len(xyt.splitlines())} minutiae")
                 if image_path:
@@ -1631,7 +1656,8 @@ class DatabaseHelper:
             
             # Only select the optional columns that actually exist, so the
             # query keeps working before the NBIS migration has been applied.
-            optional = [c for c in ('xyt_template', 'image_path', 'minutiae_count')
+            optional = [c for c in ('xyt_template', 'image_path', 'minutiae_count', 'sift_gray',
+                                    'sensor_template')
                         if c in self.get_fingerprint_columns()]
             select_extra = (', ' + ', '.join(optional)) if optional else ''
 
@@ -1674,6 +1700,10 @@ class DatabaseHelper:
                     'xyt': extra.get('xyt_template'),
                     'image_path': extra.get('image_path'),
                     'minutiae_count': extra.get('minutiae_count'),
+                    # grayscale SIFT engine (None for presses enrolled before it)
+                    'sift_gray': bytes(extra['sift_gray']) if extra.get('sift_gray') else None,
+                    # the R503's own template, kept on a few presses for the sensor double-check
+                    'sensor_template': bytes(extra['sensor_template']) if extra.get('sensor_template') else None,
                 }
                 grouped.setdefault(finger_index, []).append(sample)
             

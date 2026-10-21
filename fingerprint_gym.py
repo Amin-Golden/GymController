@@ -33,6 +33,26 @@ except Exception as _local_import_error:  # noqa: BLE001
     LOCAL_MODULE_AVAILABLE = False
     print(f"[WARNING] fingerprint_local not importable ({_local_import_error})")
 
+# Grayscale SIFT engine with geometric verification and a FAISS index - the
+# production matcher (see fingerprint_sift.py for the measurements).
+try:
+    import fingerprint_sift
+    GRAY_MODULE_AVAILABLE = fingerprint_sift.FAISS_AVAILABLE
+    if not GRAY_MODULE_AVAILABLE:
+        print("[WARNING] faiss is not installed - the grayscale fingerprint engine is unavailable "
+              "(pip install faiss-cpu)")
+except Exception as _gray_import_error:  # noqa: BLE001
+    GRAY_MODULE_AVAILABLE = False
+    print(f"[WARNING] fingerprint_sift not importable ({_gray_import_error})")
+
+# Commands to the ESP32 for the sensor double-check (CONFIRM / MATCHTMPL / IMG2TMPL).
+try:
+    import r503_link
+    R503_LINK_AVAILABLE = True
+except Exception as _link_import_error:  # noqa: BLE001
+    R503_LINK_AVAILABLE = False
+    print(f"[WARNING] r503_link not importable ({_link_import_error}) - no sensor double-check")
+
 # Raw image retention, so the matching algorithm can be changed later without
 # asking every member to enroll again.
 try:
@@ -86,16 +106,36 @@ ENROLL_PROMPTS = [
 ]
 
 # Which matcher to use:
-#   "auto"  - NBIS if its binaries are installed, else the pure-Python minutiae
-#             engine, else SIFT (default)
+#   "auto"  - the grayscale engine (fingerprint_sift) when available (default)
+#   "gray"  - the grayscale engine only
 #   "nbis"  - NBIS only (needs mindtct/bozorth3 native binaries)
 #   "local" - pure-Python minutiae engine only (no native dependencies)
 #   "sift"  - the original SIFT/ORB + FAISS engine only
 #
-# SIFT is kept only to read enrollments made before the minutiae migration. It
-# is not a fingerprint algorithm: measured on real captures it scores d' = 1.0
-# and rejects ~75% of genuine members at its own threshold. Do not select it.
+# The grayscale engine needs the firmware that uploads the sensor's grayscale
+# image (finger_UDP.ino: UpImage before Img2Tz) and members enrolled with it;
+# presses enrolled with the other engines are not read by it. Those engines
+# matched the two-level skeleton older firmware sent and are kept only for
+# reference: on the same presses they identified far fewer members.
 FINGERPRINT_ENGINE = os.environ.get("FINGERPRINT_ENGINE", "auto").lower()
+GRAY_ENGINE = FINGERPRINT_ENGINE in ("auto", "gray") and GRAY_MODULE_AVAILABLE
+if FINGERPRINT_ENGINE == "gray" and not GRAY_MODULE_AVAILABLE:
+    print("[ERROR] FINGERPRINT_ENGINE=gray but fingerprint_sift/faiss is unavailable - no fingerprint matching")
+
+# When an enrolling finger matches ANOTHER member at the match threshold:
+# "reject" refuses to save it (a double enrollment, or two members the door
+# would confuse), "warn" saves it anyway and only reports it.
+SIFT_ENROLL_COLLISION = os.environ.get("SIFT_ENROLL_COLLISION", "reject").lower()
+
+# Sensor double-check: a match scoring at least SIFT_MATCH_INLIERS but below
+# this is accepted only if the R503's own matcher - a different algorithm -
+# agrees on the same press. Clear matches (genuine presses median ~170) are not
+# slowed down; a double-check costs ~4 s. 0 turns it off.
+SIFT_CONFIRM_BELOW = int(os.environ.get("SIFT_CONFIRM_BELOW", "40"))
+
+# Presses per finger whose R503 template is stored at enrollment (~3.5 s each)
+# and tried, one by one, at a double-check.
+SENSOR_TEMPLATES_PER_FINGER = int(os.environ.get("SENSOR_TEMPLATES_PER_FINGER", "3"))
 
 # In "auto" mode, fall back to the SIFT engine when the minutiae engine reports
 # no match. Useful while members enrolled before the migration have no template.
@@ -237,7 +277,7 @@ def get_minutiae_engine():
     """
     global _engine_module, _engine, _engine_gallery, _engine_checked
 
-    if FINGERPRINT_ENGINE == "sift":
+    if FINGERPRINT_ENGINE == "sift" or GRAY_ENGINE:
         return (None, None, None)
 
     with _engine_lock:
@@ -295,6 +335,29 @@ def engine_invalidate_gallery():
 nbis_invalidate_gallery = engine_invalidate_gallery
 
 
+_gray_gallery = None
+_gray_lock = threading.Lock()
+
+
+def get_gray_gallery():
+    """The process-wide grayscale gallery (FAISS index + enrolled presses), or None."""
+    global _gray_gallery
+    if not GRAY_ENGINE:
+        return None
+    with _gray_lock:
+        if _gray_gallery is None:
+            _gray_gallery = fingerprint_sift.SiftGallery()
+        return _gray_gallery
+
+
+def _keypoints_xyt(features, n=60):
+    """Strongest keypoints as .xyt lines, so the enrollment preview can mark them."""
+    if features is None:
+        return None
+    return "".join(f"{int(x)} {int(y)} {int(np.degrees(a)) % 360} 50\n"
+                   for (x, y), a in zip(features.pts[:n], features.ang[:n]))
+
+
 def build_sample_record(image, processor, client_id=None, finger_index=None, sample_number=None,
                         nbis_engine=None):
     """Turn one captured image into a database-ready sample.
@@ -311,6 +374,15 @@ def build_sample_record(image, processor, client_id=None, finger_index=None, sam
         path = fingerprint_image_store.save_enrollment_image(image, client_id, finger_index, sample_number)
         if path:
             record['image_path'] = path
+
+    # Grayscale engine: its packed keypoints are all the database needs
+    if GRAY_ENGINE:
+        features = fingerprint_sift.extract(image)
+        if features is None:
+            return None
+        record.update(sift_gray=fingerprint_sift.pack(features), num_features=features.n,
+                      gray=features, keypoints=[], confidence=1.0)
+        return record
 
     # 2. SIFT/ORB descriptors (original engine, still stored)
     features = processor.extract_features(image)
@@ -447,6 +519,9 @@ class UDPFingerprintReceiver:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(('', port))
         self.sock.settimeout(1.0)
+        # (sender IP, header timestamp) of the last image: names the press for
+        # the sensor double-check (the ESP32 keeps that image for a moment)
+        self.last_press = None
         print(f"✓ Fingerprint UDP receiver listening on port {port}")
     
     def receive_image(self, timeout=30.0):
@@ -476,6 +551,7 @@ class UDPFingerprintReceiver:
                         print(f"📥 Receiving fingerprint: {image_width}x{image_height}, {size} bytes")
                         header_received = True
                         expected_size = int(size)
+                        self.last_press = (addr[0], int(timestamp))
                     continue
                 
                 # Check for end marker
@@ -526,6 +602,7 @@ class DualESP32FingerprintSystem:
         self.db = db_helper
         self.processor = ImprovedFingerprintProcessor(embedding_dim=128, use_pca=True)
         self.nbis_module, self.nbis, self.nbis_gallery = get_minutiae_engine()
+        self.gray = get_gray_gallery()
         self.sock = sock
         self.fingerprint_cache = fingerprint_cache  # Shared cache from RetinaFaceL
         self.pause_callback = pause_callback
@@ -555,14 +632,35 @@ class DualESP32FingerprintSystem:
         self.locker_running = False
         self.enrollment_lock = threading.RLock()
         self.enrollment_active = threading.Event()
-        
+
+        self._warm_gray_gallery()
         print("✅ Dual ESP32 fingerprint system initialized")
-    
+
+    def _warm_gray_gallery(self):
+        """Load the enrolled presses into the grayscale index in the background,
+        so the first member at the door does not wait for it."""
+        if self.gray is None:
+            return
+        profiles = list(self.registered_fingerprints)
+
+        def warm():
+            try:
+                self.gray.sync(profiles)
+                st = self.gray.stats()
+                old = sum(1 for p in profiles if not any(s.get('sift_gray') for s in p.get('fingerprints', [])))
+                print(f"[SIFT] ready: {st['members']} members, {st['fingers']} fingers, {st['presses']} presses")
+                if old:
+                    print(f"[SIFT] {old} members have only old-format fingerprints - they must enroll again")
+            except Exception as e:  # noqa: BLE001
+                print(f"❌ Could not load the fingerprint gallery: {e}")
+        threading.Thread(target=warm, daemon=True).start()
+
     def set_fingerprint_cache(self, fingerprint_cache):
         """Set or update the fingerprint cache reference"""
         self.fingerprint_cache = fingerprint_cache
         if fingerprint_cache:
             self.registered_fingerprints = fingerprint_cache.get_fingerprints()
+            self._warm_gray_gallery()
     
     def _request_pause(self, reason="fingerprint enrollment"):
         """Request main pipeline pause, returns True if pause acquired."""
@@ -733,7 +831,7 @@ class DualESP32FingerprintSystem:
                 print(f"\n🚪 ENTRANCE - Fingerprint received")
                 
                 # Extract and identify
-                result = self._identify_fingerprint(image, "ENTRANCE")
+                result = self._identify_fingerprint(image, "ENTRANCE", self.entrance_receiver.last_press)
                 
                 # Call entrance callback
                 if self.entrance_callback:
@@ -765,7 +863,7 @@ class DualESP32FingerprintSystem:
                 print(f"\n🔐 LOCKER - Fingerprint received")
                 
                 # Extract and identify
-                result = self._identify_fingerprint(image, "LOCKER")
+                result = self._identify_fingerprint(image, "LOCKER", self.locker_receiver.last_press)
                 
                 # Call locker callback
                 if self.locker_callback:
@@ -782,8 +880,8 @@ class DualESP32FingerprintSystem:
                 print(f"❌ Locker listener error: {e}")
                 time.sleep(1)
     
-    def _identify_fingerprint(self, image, source="UNKNOWN"):
-        """Identify a fingerprint image.
+    def _identify_fingerprint(self, image, source="UNKNOWN", press=None):
+        """Identify a fingerprint image. press: (ESP32 IP, image timestamp), for the sensor double-check.
 
         NBIS (MINDTCT + BOZORTH3) is the primary matcher; the SIFT/FAISS engine
         is kept as a fallback for members whose enrollment predates the NBIS
@@ -797,6 +895,10 @@ class DualESP32FingerprintSystem:
             print(f"⚠️ [{source}] No fingerprints enrolled")
             self._save_query_image(image, source, "nomatch")
             return None
+
+        # --- grayscale engine (production) ---------------------------------
+        if self.gray is not None:
+            return self._identify_with_gray(image, source, press)
 
         # --- NBIS engine ---------------------------------------------------
         if self.nbis is not None:
@@ -816,6 +918,91 @@ class DualESP32FingerprintSystem:
         if not result:
             self._save_query_image(image, source, "nomatch")
         return result
+
+    def _identify_with_gray(self, image, source="UNKNOWN", press=None):
+        """1:N with the grayscale engine. Returns (client_id, name, confidence) or None."""
+        if not fingerprint_sift.is_grayscale(image):
+            print(f"❌ [{source}] the sensor sent a two-level skeleton image - flash the current "
+                  f"finger_UDP.ino (it uploads the grayscale image)")
+            return None
+        t0 = time.time()
+        query = fingerprint_sift.extract(image)
+        if query is None or query.n < 10:
+            print(f"❌ [{source}] no usable ridges in this press")
+            self._save_query_image(image, source, "nomatch")
+            return None
+        try:
+            self.gray.sync(self.registered_fingerprints)
+            best, ranking = self.gray.identify(query)
+        except Exception as e:  # noqa: BLE001 - a bad scan must not kill the listener
+            print(f"❌ [{source}] grayscale identification error: {e}")
+            return None
+        elapsed = time.time() - t0
+        threshold = fingerprint_sift.SIFT_MATCH_INLIERS
+        if best:
+            inl, client_id, finger, name = best
+            runner_up = next((r[0] for r in ranking if r[1] != client_id), 0)
+            note = ""
+            if inl < SIFT_CONFIRM_BELOW:
+                verdict = self._sensor_confirm(press, client_id, finger, source)
+                if verdict is False:
+                    print(f"❌ [{source}] NO MATCH - {name} scored {inl} matches (borderline) and "
+                          f"the sensor did not confirm ({time.time() - t0:.2f}s)")
+                    self._save_query_image(image, source, f"unconfirmed_{client_id}")
+                    return None
+                note = ", sensor confirmed" if verdict else ", not double-checked (no sensor template)"
+            print(f"✅ [{source}] MATCH: {name} (ID: {client_id}, finger {finger}) - {inl} matches "
+                  f"(next member {runner_up}, need {threshold}{note}, {time.time() - t0:.2f}s)")
+            self._save_query_image(image, source, f"match_{client_id}")
+            return (client_id, name, fingerprint_sift.confidence(inl))
+        top = (f"best {ranking[0][3] or ranking[0][1]} with {ranking[0][0]} matches" if ranking
+               else "no candidate")
+        print(f"❌ [{source}] NO MATCH - {top} (need {threshold}, {elapsed:.2f}s)")
+        self._save_query_image(image, source, "nomatch")
+        return None
+
+    def _sensor_confirm(self, press, client_id, finger, source):
+        """Ask the R503's own matcher whether this press is that member's finger.
+
+        True - the sensor matched it to one of the finger's stored templates.
+        False - it did not, or the check could not run (the ESP32 already holds a
+                newer press, does not answer, ...): the member presses again.
+        None - the member has no stored sensor template (enrolled before the
+               double-check existed, or the sensor was unreachable then); the
+               match stands, unchecked.
+        """
+        templates = [s['sensor_template']
+                     for p in self.registered_fingerprints if p.get('client_id') == client_id
+                     for f in p.get('fingers', []) if f.get('finger_index') == finger
+                     for s in f.get('samples', []) if s.get('sensor_template')]
+        if not templates:
+            print(f"   [{source}] member {client_id} finger {finger} has no sensor template - "
+                  f"not double-checked (enroll the finger again to enable it)")
+            return None
+        if not R503_LINK_AVAILABLE or press is None:
+            print(f"   [{source}] cannot reach the sensor for the double-check")
+            return False
+        ip, stamp = press
+        if source == "ENTRANCE":
+            self._status("Checking fingerprint...", console=False)
+        t0 = time.time()
+        try:
+            with r503_link.SensorLink(ip, ENTRANCE_ESP_PORT) as link:
+                ok, reply = link.prepare_confirm(stamp)
+                if not ok:
+                    print(f"   [{source}] sensor double-check unavailable ({reply}) - press again")
+                    return False
+                for k, template in enumerate(templates[:SENSOR_TEMPLATES_PER_FINGER], start=1):
+                    res = link.match(template)
+                    if res and res[0]:
+                        print(f"   [{source}] sensor confirms member {client_id} "
+                              f"(template {k}, score {res[1]}, {time.time() - t0:.1f}s)")
+                        return True
+                    print(f"   [{source}] sensor: template {k} "
+                          f"{'no match (score %d)' % res[1] if res else 'no answer'}")
+        except OSError as e:
+            print(f"   [{source}] sensor double-check failed: {e}")
+        return False
 
     def _identify_with_nbis(self, image, source="UNKNOWN"):
         """1:N minutiae matching. Returns (client_id, name, confidence) or None."""
@@ -1006,10 +1193,13 @@ class DualESP32FingerprintSystem:
             self._status(f"Finger {finger_index}: {SAMPLES_PER_FINGER} presses", console=False)
 
             receiver = self.entrance_receiver if use_entrance_esp else self.locker_receiver
-            
+
             esp_ip = ENTRANCE_ESP_IP if use_entrance_esp else LOCKER_ESP_IP
             esp_port = ENTRANCE_ESP_PORT if use_entrance_esp else LOCKER_ESP_PORT
-            
+
+            if self.gray is not None:
+                return self._enroll_finger_gray(client_id, finger_index, receiver, esp_ip, esp_port)
+
             samples = []
             retries_left = ENROLL_RETRY_BUDGET
             # Whole-finger template stitched so far (pure-Python engine only: the
@@ -1121,26 +1311,10 @@ class DualESP32FingerprintSystem:
                 print("✗ Not enough valid samples for this finger")
                 return False
             
-            # Save to database with finger_index
-            success = self.db.save_fingerprint_features(client_id, finger_index, samples)
-            stored = len(samples)
-            if not success:
-                self._status(f"Save failed: {self._db_error()}")
-                if len(samples) > FALLBACK_STORED_PRESSES:
-                    # The members database may allow only 5 samples per finger
-                    # (a sample_number limit from the admin app - see
-                    # migrate_fingerprint_presses.sql). Keep the strongest presses
-                    # so the member is enrolled now; the whole-finger template
-                    # below is still stitched from ALL presses.
-                    best = sorted(samples, key=lambda s: s.get('minutiae_count') or 0,
-                                  reverse=True)[:FALLBACK_STORED_PRESSES]
-                    success = self.db.save_fingerprint_features(client_id, finger_index, best)
-                    stored = len(best)
-                    if success:
-                        self._status(f"Saved the best {FALLBACK_STORED_PRESSES} presses - run "
-                                     f"migrate_fingerprint_presses.sql to keep all {len(samples)}")
-                    else:
-                        self._status(f"Save failed again: {self._db_error()}")
+            # Save to database with finger_index (the whole-finger template below
+            # is stitched from ALL presses even if only the strongest are stored)
+            success, stored = self._save_finger(client_id, finger_index, samples,
+                                                strength=lambda s: s.get('minutiae_count') or 0)
 
             if success and fusing:
                 # Re-stitch all presses in the best order (a press that did not fit
@@ -1161,45 +1335,204 @@ class DualESP32FingerprintSystem:
                           "- the finger is still enrolled with its separate presses")
 
             if success:
-                # Both matchers cache enrolled data - make them pick up the new finger
-                nbis_invalidate_gallery()
-                self.processor.faiss_index = None
-                self.processor.cache_valid = False
-                print(f"✅ Saved {stored} samples for finger {finger_index}")
-                self._status(f"Saved {stored} samples for finger {finger_index}", console=False)
-                # Send success to ESP32
-                if self.sock:
-                    try:
-                        sendstr = f"Success Finger {finger_index}"
-                        self.sock.sendto(sendstr.encode("utf-8"), (esp_ip, esp_port))
-                    except Exception:
-                        pass
-                
-                # Update cache if available
-                if self.fingerprint_cache:
-                    success_update = self.fingerprint_cache.update_client_fingerprints(client_id)
-                    if success_update:
-                        # Update registered fingerprints from cache
-                        self.registered_fingerprints = self.fingerprint_cache.get_fingerprints()
-                        print(f"✅ Fingerprint cache updated in fingerprint system")
-                        self._status("Fingerprint cache updated", console=False)
+                self._after_finger_saved(client_id, finger_index, stored, esp_ip, esp_port)
 
-                # Update local cache without reloading all clients when cache is not available
-                if not self.fingerprint_cache:
-                    profile = self.db.get_fingerprint_profile(client_id)
-                    if profile:
-                        self.registered_fingerprints = [
-                            p for p in self.registered_fingerprints if p.get('client_id') != client_id
-                        ]
-                        self.registered_fingerprints.append(profile)
-                    else:
-                        # Fallback to full reload if targeted refresh failed
-                        self.reload_fingerprints()
-            
             return success
         finally:
             if manage_pause and single_pause:
                 self._release_pause()
+
+    def _after_finger_saved(self, client_id, finger_index, stored, esp_ip, esp_port):
+        """Make every matcher and cache pick up a newly saved finger, and tell the ESP32."""
+        # Both matchers cache enrolled data - make them pick up the new finger
+        nbis_invalidate_gallery()
+        self.processor.faiss_index = None
+        self.processor.cache_valid = False
+        print(f"✅ Saved {stored} samples for finger {finger_index}")
+        self._status(f"Saved {stored} samples for finger {finger_index}", console=False)
+        # Send success to ESP32
+        if self.sock:
+            try:
+                sendstr = f"Success Finger {finger_index}"
+                self.sock.sendto(sendstr.encode("utf-8"), (esp_ip, esp_port))
+            except Exception:
+                pass
+
+        # Update cache if available
+        if self.fingerprint_cache:
+            success_update = self.fingerprint_cache.update_client_fingerprints(client_id)
+            if success_update:
+                # Update registered fingerprints from cache
+                self.registered_fingerprints = self.fingerprint_cache.get_fingerprints()
+                print(f"✅ Fingerprint cache updated in fingerprint system")
+                self._status("Fingerprint cache updated", console=False)
+
+        # Update local cache without reloading all clients when cache is not available
+        if not self.fingerprint_cache:
+            profile = self.db.get_fingerprint_profile(client_id)
+            if profile:
+                self.registered_fingerprints = [
+                    p for p in self.registered_fingerprints if p.get('client_id') != client_id
+                ]
+                self.registered_fingerprints.append(profile)
+            else:
+                # Fallback to full reload if targeted refresh failed
+                self.reload_fingerprints()
+
+        if self.gray is not None:
+            self.gray.sync(self.registered_fingerprints)
+
+    def _save_finger(self, client_id, finger_index, samples, strength):
+        """Save a finger's presses. Returns (ok, presses stored).
+
+        The members database may allow only 5 samples per finger (a sample_number
+        limit from the admin app - see migrate_fingerprint_presses.sql). If it
+        refuses them all, keep the strongest FALLBACK_STORED_PRESSES so the member
+        is enrolled now.
+        """
+        success = self.db.save_fingerprint_features(client_id, finger_index, samples)
+        stored = len(samples)
+        if not success:
+            self._status(f"Save failed: {self._db_error()}")
+            if len(samples) > FALLBACK_STORED_PRESSES:
+                best = sorted(samples, key=strength, reverse=True)[:FALLBACK_STORED_PRESSES]
+                success = self.db.save_fingerprint_features(client_id, finger_index, best)
+                stored = len(best)
+                if success:
+                    self._status(f"Saved the best {FALLBACK_STORED_PRESSES} presses - run "
+                                 f"migrate_fingerprint_presses.sql to keep all {len(samples)}")
+                else:
+                    self._status(f"Save failed again: {self._db_error()}")
+        return success, stored
+
+    def _sensor_templates(self, samples, ip):
+        """Store the R503's own template on the strongest presses, for the sensor double-check.
+
+        Each one is built by the sensor from the press's image (sent back to it),
+        ~3.5 s apiece. A failure only means this finger is not double-checked."""
+        if not (R503_LINK_AVAILABLE and SIFT_CONFIRM_BELOW > 0 and SENSOR_TEMPLATES_PER_FINGER > 0 and ip):
+            return 0
+        columns = getattr(self.db, 'get_fingerprint_columns', None)
+        if columns is not None and 'sensor_template' not in columns():
+            print("⚠️  No sensor_template column - run migrate_fingerprint_sift_gray.sql to enable "
+                  "the sensor double-check")
+            return 0
+        best = sorted(samples, key=lambda s: s.get('num_features') or 0, reverse=True)[:SENSOR_TEMPLATES_PER_FINGER]
+        self._status("Preparing the sensor check...", console=False)
+        made = 0
+        try:
+            with r503_link.SensorLink(ip, ENTRANCE_ESP_PORT) as link:
+                for s in best:
+                    t = link.image_template(s['image'])
+                    if t and len(t) >= 256 and any(t):
+                        s['sensor_template'] = t
+                        made += 1
+        except OSError as e:
+            print(f"⚠️  Sensor templates failed: {e}")
+        print(f"   Sensor templates: {made}/{len(best)} presses")
+        if made == 0:
+            self._status("Sensor check not available for this finger", console=False)
+        return made
+
+    def _enroll_finger_gray(self, client_id, finger_index, receiver, esp_ip, esp_port):
+        """Enroll one finger with the grayscale engine.
+
+        Each press must be grayscale, carry enough keypoints, and match an earlier
+        press of this finger; the finished finger must not match any OTHER member
+        (a double enrollment, or two members the door would confuse).
+        """
+        threshold = fingerprint_sift.SIFT_MATCH_INLIERS
+        samples = []
+        retries_left = ENROLL_RETRY_BUDGET
+        while len(samples) < SAMPLES_PER_FINGER:
+            i = len(samples)
+            prompt = ENROLL_PROMPTS[i % len(ENROLL_PROMPTS)]
+            print(f"\n📌 Finger {finger_index} - Press {i+1}/{SAMPLES_PER_FINGER}: {prompt}")
+            self._status(f"Finger {finger_index} - press {i+1}/{SAMPLES_PER_FINGER}", console=False)
+            self._status(prompt, console=False)
+            if self.sock:
+                try:
+                    sendstr = f"Finger {finger_index} - Sample {i+1}"
+                    self.sock.sendto(sendstr.encode("utf-8"), (esp_ip, esp_port))
+                    self.sock.sendto(sendstr.encode("utf-8"), (pc_ip, pc_port))
+                except Exception:
+                    pass
+
+            image = receiver.receive_image(timeout=60.0)
+            if image is None:
+                print(f"✗ Failed to receive sample {i+1}")
+                self._status("No press received - enrollment stopped")
+                return False
+            sender = receiver.last_press[0] if receiver.last_press else None
+            title = f"Client {client_id} - Finger {finger_index} - Press {i+1}/{SAMPLES_PER_FINGER}: {prompt}"
+
+            if not fingerprint_sift.is_grayscale(image):
+                self._status("Sensor sends the old black-and-white image - flash finger_UDP.ino")
+                publish_fingerprint_preview(image, title, None, "REJECTED: not a grayscale image", ok=False)
+                return False
+
+            record = build_sample_record(image, self.processor, client_id=client_id,
+                                         finger_index=finger_index, sample_number=i + 1)
+            f = record.get('gray') if record else None
+            problem = None
+            if f is None:
+                problem = "no usable ridges - clean the finger"
+            elif f.n < fingerprint_sift.SIFT_MIN_KEYPOINTS:
+                problem = f"only {f.n} features (need {fingerprint_sift.SIFT_MIN_KEYPOINTS}) - press firmer"
+            elif samples:
+                own = max(fingerprint_sift.inliers(f, s['gray']) for s in samples)
+                if own < threshold:
+                    problem = (f"does not match the earlier presses ({own} matches, need {threshold}) "
+                               f"- same finger, move less")
+            if problem:
+                retries_left -= 1
+                print(f"✗ Rejected: {problem}")
+                publish_fingerprint_preview(image, title, _keypoints_xyt(f), f"REJECTED: {problem}", ok=False)
+                self._status(f"Rejected: {problem}", console=False)
+                if retries_left < 0:
+                    self._status("Too many rejected presses - enrollment stopped")
+                    return False
+                continue
+
+            record['image'] = image                  # for the sensor template below; not stored
+            samples.append(record)
+            print(f"✓ Press {i+1} OK ({f.n} features)")
+            publish_fingerprint_preview(image, title, _keypoints_xyt(f), f"OK: {f.n} features")
+            self._status(f"Press {i+1} OK: {f.n} features", console=False)
+            if i < SAMPLES_PER_FINGER - 1:
+                next_prompt = ENROLL_PROMPTS[(i + 1) % len(ENROLL_PROMPTS)]
+                print(f"   Lift the finger. Next: {next_prompt}")
+                self._status("Lift the finger", console=False)
+                self._status(f"Next: {next_prompt}", console=False)
+                time.sleep(1)
+
+        # The new finger against every other member
+        self._status("Checking against other members...", console=False)
+        self.gray.sync(self.registered_fingerprints)
+        closest = (0, None, None, "")
+        for s in samples:
+            _, ranking = self.gray.identify(s['gray'], exclude_client=client_id)
+            if ranking and ranking[0][0] > closest[0]:
+                closest = ranking[0]
+        if closest[0] >= threshold:
+            msg = (f"This finger matches member {closest[1]} ({closest[3]}), finger {closest[2]}: "
+                   f"{closest[0]} matches")
+            print(f"❌ {msg}")
+            self._status(msg, console=False)
+            if SIFT_ENROLL_COLLISION == "reject":
+                self._status("Not saved - check for a double enrollment", console=False)
+                return False
+        else:
+            who = f"member {closest[1]}" if closest[1] is not None else "none"
+            print(f"   Closest other member: {who} with {closest[0]} matches (threshold {threshold})")
+
+        self._sensor_templates(samples, sender)
+
+        success, stored = self._save_finger(client_id, finger_index, samples,
+                                            strength=lambda s: s.get('num_features') or 0)
+        if success:
+            self._after_finger_saved(client_id, finger_index, stored, esp_ip, esp_port)
+        return success
     
     def enroll_client_two_fingers(self, client_id, use_entrance_esp=True):
         """

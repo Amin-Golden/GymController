@@ -1,8 +1,11 @@
 # Additional requirements for improved fingerprint recognition
 # Install with: pip install -r requirements_fingerprint.txt
 
-# Fast similarity search (required for improved performance)
+# Fast similarity search - required by the fingerprint engine (fingerprint_sift.py)
 faiss-cpu>=1.7.4
+# The engine also needs OpenCV >= 4.4 (SIFT is in the main package since then).
+# Not listed as a requirement so it cannot clash with the OpenCV already installed
+# (opencv-python, opencv-contrib-python or the system package all work).
 # For GPU acceleration (optional, if you have CUDA):
 # faiss-gpu>=1.7.4
 

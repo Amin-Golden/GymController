@@ -240,7 +240,10 @@ def to_skeleton(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         g = np.exp(-0.5 * (xr ** 2 + yr ** 2) / sigma ** 2) * np.cos(2 * np.pi * freq * xr)
         bank.append((g - g.mean()).astype(np.float32))
     resp = np.stack([cv2.filter2D(norm, cv2.CV_32F, k) for k in bank])
-    idx = (np.round(orient / np.pi * n_or).astype(np.int32) % n_or)
+    # A bank kernel at angle th oscillates ALONG th, so it has to run across the
+    # ridges - perpendicular to orient, which is the ridge direction.
+    across = np.mod(orient + np.pi / 2.0, np.pi)
+    idx = (np.round(across / np.pi * n_or).astype(np.int32) % n_or)
     yy, xx = np.mgrid[0:image.shape[0], 0:image.shape[1]]
     enhanced = resp[idx, yy, xx]
 

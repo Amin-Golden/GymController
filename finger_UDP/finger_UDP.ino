@@ -1,9 +1,10 @@
 /*
   R503 Fingerprint Sensor -> Gym Controller UDP bridge (ESP32)
 
-  Replaces the FPM383C sketch. Captures a 192x192 image from the R503,
-  expands it to 8-bit greyscale and streams it to the PC with the exact
-  protocol fingerprint_gym.py already parses:
+  Replaces the FPM383C sketch. Captures the R503's grayscale image (uploaded
+  before Img2Tz, which would overwrite it with a ridge skeleton), expands it
+  to 8-bit greyscale and streams it to the PC with the exact protocol
+  fingerprint_gym.py already parses:
 
       20-byte header : "FPIMG\0\0\0" + width(u16) + height(u16) + size(u32) + timestamp(u32)  (little endian)
       image data     : raw 8-bit pixels in chunks of <=1400 bytes
@@ -45,16 +46,28 @@
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 
 // ---------------------------------------------------------------- role -----
 // ROLE 0 = entrance (IP .120, image port 8889), ROLE 1 = locker (IP .121, 8890)
+// finger_UDP/ota_upload.py builds each unit with -DROLE=<n>; this default is
+// what the Arduino IDE builds.
+#ifndef ROLE
 #define ROLE 0
+#endif
+
+// ---------------------------------------------------------------- OTA ------
+// Once this sketch is on a unit (one USB flash), later versions go over WiFi:
+// the Arduino IDE lists the units as network ports ("gym-fp-entrance",
+// "gym-fp-locker"), or run finger_UDP/ota_upload.py for both. Uploads need
+// this password (ota_upload.py reads it from here).
+const char* otaPassword = "gym-ota-2026";
 
 // ---------------------------------------------------------------- network --
-const char* ssid     = "HOME";
-const char* password = "amin% 1993";
+const char* ssid     = "Autoro";
+const char* password = "#Autoro@2027";
 
-const char* pcIP = "192.168.1.100";       // PC running fingerprint_gym.py
+const char* pcIP = "192.168.1.2";       // PC running fingerprint_gym.py
 #if ROLE == 0
 const int   imagePort = 8889;             // UDP_PORT_ENTRANCE
 IPAddress   local_IP(192, 168, 1, 120);   // ENTRANCE_ESP_IP
@@ -84,7 +97,7 @@ WiFiUDP udp;
 // the same card is ignored until it has been away for RFID_REPEAT_MS.
 // The PC tells the two readers apart by port: entrance cards check in/out,
 // locker cards open the member's locker.
-#define RFID_ENABLED    1      // 0 = no reader fitted on this unit
+#define RFID_ENABLED    0      // 0 = no reader fitted on this unit
 #define RFID_RX_PIN     25     // ESP32 receives here <- reader TX
 #define RFID_TX_PIN     26     // ESP32 transmits here -> reader RX
 #define RFID_BAUD       9600   // RDM6300 and most UART readers
@@ -128,6 +141,8 @@ uint32_t imgBytes  = IMAGE_BYTES;
 // Copy of the last frame actually sent, for the duplicate (residue) gate.
 uint8_t* lastSentFrame = NULL;
 uint32_t lastSentBytes = 0;
+uint32_t lastSentStamp = 0;      // header timestamp of that frame: the PC names the press by it
+bool     lastSentPacked = false; // the sensor delivered it 4-bit packed (CONFIRM sends it back so)
 
 // ============================================================================
 // Minimal R503 (ZFM protocol) driver
@@ -281,8 +296,71 @@ public:
   long upImage(uint8_t* dst, uint32_t dstCap) {
     uint8_t p[1] = { 0x0A };
     int code = command(p, 1, NULL, 0, 1500);
-    if (code != 0x00) return -code;
+    if (code != 0x00) return code > 0 ? -code : code - 1000;   // refused / no ACK
+    return readDataStream(dst, dstCap);
+  }
 
+  // UpChar: upload the feature file in CharBuffer `slot` - 384 bytes after
+  // Img2Tz, 768 after RegModel (datasheet). Same data stream as UpImage.
+  long upChar(uint8_t slot, uint8_t* dst, uint32_t dstCap) {
+    uint8_t p[2] = { 0x08, slot };
+    int code = command(p, 2, NULL, 0, 1500);
+    if (code != 0x00) return code > 0 ? -code : code - 1000;
+    return readDataStream(dst, dstCap);
+  }
+
+  // ReadInfPage: the 512-byte information page, same data stream as UpImage.
+  long readInfPage(uint8_t* dst, uint32_t dstCap) {
+    uint8_t p[1] = { 0x16 };
+    int code = command(p, 1, NULL, 0, 1500);
+    if (code != 0x00) return code > 0 ? -code : code - 1000;
+    return readDataStream(dst, dstCap);
+  }
+
+  // Match: 1:1 compare CharBuffer1 against CharBuffer2. 0x00 match, 0x08 no match.
+  int matchBuffers(uint16_t* score) {
+    uint8_t p[1] = { 0x03 }, out[2] = { 0, 0 };
+    int code = command(p, 1, out, 2, 2000);
+    if (score) *score = ((uint16_t)out[0] << 8) | out[1];
+    return code;
+  }
+
+  // RegModel: merge CharBuffer1 + CharBuffer2 into one template.
+  int regModel() { uint8_t p[1] = { 0x05 }; return command(p, 1, NULL, 0, 2000); }
+
+  // DownImage / DownChar: the host sends the data after the ACK.
+  int downImage(const uint8_t* src, uint32_t len) {
+    uint8_t p[1] = { 0x0B };
+    int code = command(p, 1, NULL, 0, 1500);
+    if (code != 0x00) return code;
+    return writeDataStream(src, len);
+  }
+
+  int downChar(uint8_t slot, const uint8_t* src, uint32_t len) {
+    uint8_t p[2] = { 0x09, slot };
+    int code = command(p, 2, NULL, 0, 1500);
+    if (code != 0x00) return code;
+    return writeDataStream(src, len);
+  }
+
+  // Send src as data packets of packetSize bytes, the last one flagged end.
+  // Some firmwares ACK the stream and some don't; waiting briefly here keeps a
+  // late ACK from being read as the reply to the next command.
+  int writeDataStream(const uint8_t* src, uint32_t len) {
+    uint16_t ps = packetSize ? packetSize : 128;
+    for (uint32_t off = 0; off < len; off += ps) {
+      uint16_t n = (uint16_t)min((uint32_t)ps, len - off);
+      writePacket(off + n >= len ? PID_DATA_END : PID_DATA, src + off, n);
+    }
+    port.flush();
+    uint8_t pid, buf[16];
+    int n = readFrame(pid, buf, sizeof(buf), 200);
+    if (n >= 1 && pid == PID_ACK) return buf[0];
+    return 0;
+  }
+
+  // Collect the data packets that follow an UpImage/UpChar ACK.
+  long readDataStream(uint8_t* dst, uint32_t dstCap) {
     uint32_t received = 0;
     uint8_t pid, chunk[300];
     while (true) {
@@ -310,6 +388,15 @@ bool sensorOk = false;
 IPAddress lastCmdIP;
 uint16_t  lastCmdPort = 0;
 bool      forceCapture = false;
+bool      pairRequested = false;                   // PAIR: template research capture
+bool      probeRequested = false;                  // PROBE: template export check
+bool      img2TmplRequested = false;               // IMG2TMPL: template from an uploaded image
+bool      img2TmplSkeleton = true;                 // IMG2TMPL FAST: skip the skeleton upload
+bool      confirmRequested = false;                // CONFIRM <stamp>: double-check of a sent press
+uint32_t  confirmStamp = 0;
+bool      matchTmplRequested = false;              // MATCHTMPL: sensor Match of an uploaded template
+bool      liveTmplRequested = false;               // TMPL: template from a live press
+bool      liveTmplRaw = false;                     // TMPL RAW: one capture, via DownImage
 
 void setup() {
   Serial.begin(115200);
@@ -344,6 +431,14 @@ void setup() {
   Serial.printf("\nWiFi OK  ip=%s  ->  images to %s:%d\n",
                 WiFi.localIP().toString().c_str(), pcIP, imagePort);
   udp.begin(commandPort);                          // listen for PC feedback / test commands
+
+  ArduinoOTA.setHostname(ROLE == 0 ? "gym-fp-entrance" : "gym-fp-locker");
+  ArduinoOTA.setPassword(otaPassword);
+  ArduinoOTA.onStart([]() { Serial.println("OTA update starting"); });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA update done - rebooting"); });
+  ArduinoOTA.onError([](ota_error_t e) { Serial.printf("OTA update failed (error %u)\n", (unsigned)e); });
+  ArduinoOTA.begin();
+  Serial.printf("OTA ready: %s\n", ROLE == 0 ? "gym-fp-entrance" : "gym-fp-locker");
 
 #if RFID_ENABLED
   // Started before the fingerprint sensor so cards still work if the R503 is dead.
@@ -424,10 +519,18 @@ void sendStatus(const char* msg) {                 // to the PC monitor port
 // ============================================================================
 
 void loop() {
+  ArduinoOTA.handle();
   handleUdpCommands();
   handleRfid();
 
   if (!sensorOk) { delay(30); return; }
+
+  if (confirmRequested) { confirmRequested = false; runConfirm(confirmStamp); return; }
+  if (pairRequested) { pairRequested = false; runPairCapture(); return; }
+  if (probeRequested) { probeRequested = false; runProbe(); return; }
+  if (img2TmplRequested) { img2TmplRequested = false; runImg2Tmpl(); return; }
+  if (matchTmplRequested) { matchTmplRequested = false; runMatchTmpl(); return; }
+  if (liveTmplRequested) { liveTmplRequested = false; runLiveTemplate(liveTmplRaw); return; }
 
   bool wantCapture = forceCapture;
   if (!wantCapture) {
@@ -438,16 +541,26 @@ void loop() {
 
   // Capture: wait for a *usable* finger. GenImg returns 0x00 for latent
   // prints, ambient light or an empty window, so every capture must also pass
-  // the sensor's own feature extraction (Img2Tz) before it is worth uploading.
+  // the sensor's own feature extraction (Img2Tz). The image is uploaded BEFORE
+  // Img2Tz: Img2Tz overwrites the image buffer with its two-level ridge
+  // skeleton, and the PC's matcher (fingerprint_sift.py) needs the grayscale
+  // capture. A press Img2Tz rejects therefore costs one wasted upload.
   uint32_t window = forceCapture ? 10000 : 1200;
   uint32_t start = millis();
   bool usable = false;
+  long got = 0;
+  uint32_t uartMs = 0;
   while (millis() - start < window) {
     int code = sensor.genImg();
     if (code == 0x00) {
+      sensor.led(LED_CTRL_ON, LED_PURPLE);
+      uint32_t t0 = millis();
+      got = sensor.upImage(imageBuffer, IMAGE_BYTES);
+      uartMs = millis() - t0;
       int tz = sensor.img2Tz(1);
       if (tz == 0x00) { usable = true; break; }
       Serial.printf("Capture rejected by sensor (Img2Tz code %d) - not a finger\n", tz);
+      sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
       delay(200);
     } else if (code != 0x02) {
       delay(100);                                  // real error: brief backoff
@@ -462,13 +575,7 @@ void loop() {
     delay(TOUCH_PIN >= 0 ? 30 : 150);
     return;
   }
-
-  // Upload the frame from the sensor
-  sensor.led(LED_CTRL_ON, LED_PURPLE);
-  Serial.println("Finger captured - uploading image from sensor...");
-  uint32_t t0 = millis();
-  long got = sensor.upImage(imageBuffer, IMAGE_BYTES);
-  uint32_t uartMs = millis() - t0;
+  Serial.println("Finger captured - grayscale image uploaded before Img2Tz");
 
   // Identify the frame by its size. Known R503 outputs:
   //   36864 = 192x192 8-bit    18432 = 192x192 4-bit packed
@@ -498,9 +605,8 @@ void loop() {
   if (fmt->packed) {
     // Expand 4-bit to 8-bit in place, back to front (2*i >= i, so no clobbering).
     // Nibble replication (n -> n*17) maps the 16 levels over the full 0-255
-    // range instead of 0-240. Note: 16 levels is all UpImage ever delivers -
-    // the near black-and-white look comes from the sensor's internal
-    // enhancement, not from this decode.
+    // range instead of 0-240. 16 levels is all UpImage delivers; uploaded after
+    // Img2Tz it would be a 2-level skeleton instead (see the capture above).
     for (long i = got - 1; i >= 0; i--) {
       uint8_t b = imageBuffer[i];
       uint8_t hi = b >> 4, lo = b & 0x0F;
@@ -552,11 +658,13 @@ void loop() {
     Serial.printf("Duplicate check: MAD %.1f (new print)\n", mad);
   }
 
-  t0 = millis();
-  sendImageViaUDP();
+  uint32_t t0 = millis();
+  uint32_t stamp = sendImageViaUDP();
   if (lastSentFrame != NULL) {                     // remember what we sent
     memcpy(lastSentFrame, imageBuffer, imgBytes);
     lastSentBytes = imgBytes;
+    lastSentStamp = stamp;
+    lastSentPacked = fmt->packed;
   }
   if (forceCapture) {
     char msg[64];
@@ -567,20 +675,30 @@ void loop() {
   }
 
   sensor.led(LED_CTRL_FLASH, LED_BLUE, 60, 2);
-  delay(1500);                                     // cooldown, matches old sketch
-  // wait for the finger to lift so one press = one image
+  // Cooldown (as the old sketch had), then wait for the finger to lift so one
+  // press = one image. The PC may ask to double-check this press meanwhile.
+  uint32_t cool = millis();
+  while (millis() - cool < 1500) { serviceWhileWaiting(); delay(10); }
   if (TOUCH_PIN >= 0) {
     uint32_t lift = millis();
-    while (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE && millis() - lift < 5000) { handleRfid(); delay(20); }
+    while (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE && millis() - lift < 5000) { serviceWhileWaiting(); delay(20); }
   }
   sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+}
+
+// Between a press and the next capture: cards, PC commands, a pending double-check.
+void serviceWhileWaiting() {
+  handleRfid();
+  handleUdpCommands();
+  if (confirmRequested) { confirmRequested = false; runConfirm(confirmStamp); }
 }
 
 // ============================================================================
 // UDP image transmit - wire-identical to the old FPM383C sketch
 // ============================================================================
 
-void sendImageViaUDP() {
+// Returns the header timestamp - the name the PC uses for this press (CONFIRM).
+uint32_t sendImageViaUDP() {
   struct __attribute__((packed)) ImageHeader {
     char     marker[8];                            // "FPIMG\0\0\0"
     uint16_t width, height;
@@ -617,6 +735,388 @@ void sendImageViaUDP() {
   udp.write((const uint8_t*)"FPIMGEND", 8);
   udp.endPacket();
   Serial.println("Image sent");
+  return header.timestamp;
+}
+
+// ============================================================================
+// PAIR - template research capture (test/capture_template_pairs.py)
+// ============================================================================
+//
+// One press, three uploads, each sent to the tester exactly as the sensor
+// delivered it (no unpacking, no gates):
+//   'R'  UpImage BEFORE Img2Tz - the image as GenImg captured it
+//   'P'  UpImage AFTER Img2Tz  - what the normal capture path uploads
+//   'C'  UpChar(1)             - the sensor's own feature file for this press
+// R vs P shows whether Img2Tz overwrites the image buffer (which would explain
+// why every normal capture is two-valued). P + C pair the sensor's skeleton
+// with the features it extracted from it - the material for decoding the
+// template format. The normal capture path is untouched.
+
+#define CHAR_BYTES_MAX 2048
+uint8_t charBuffer[CHAR_BYTES_MAX];
+
+// Host uploads (FPUP packets, see handleUpload): image 'I' into imageBuffer,
+// template 'B' for MATCHTMPL.
+uint8_t  tmplB[CHAR_BYTES_MAX];
+uint32_t upTotal[3] = { 0, 0, 0 }, upGot[3] = { 0, 0, 0 };   // indexed I, (unused), B
+
+// Packet: "FPBD" + kind(1) + total(u32 LE) + offset(u32 LE) + payload.
+// The offset lets the PC reassemble even if UDP reorders.
+void sendBlob(char kind, const uint8_t* data, uint32_t size) {
+  const uint16_t chunk = 1380;
+  static uint8_t pkt[13 + chunk];
+  uint32_t off = 0;
+  do {
+    uint16_t n = (uint16_t)min((uint32_t)chunk, size - off);
+    memcpy(pkt, "FPBD", 4);
+    pkt[4] = (uint8_t)kind;
+    memcpy(pkt + 5, &size, 4);                     // ESP32 is little endian
+    memcpy(pkt + 9, &off, 4);
+    memcpy(pkt + 13, data + off, n);
+    udp.beginPacket(lastCmdIP, lastCmdPort);
+    udp.write(pkt, 13 + n);
+    udp.endPacket();
+    off += n;
+    delay(10);
+  } while (off < size);
+}
+
+void runPairCapture() {
+  char msg[96];
+  sensor.led(LED_CTRL_BREATH, LED_PURPLE, 100, 0);
+
+  // Wait for a press the sensor's own extractor accepts. The raw image has to
+  // be uploaded before Img2Tz runs, so a rejected press costs one upload.
+  uint32_t start = millis();
+  int tz = -1;
+  long raw = 0;
+  while (millis() - start < 15000) {
+    handleRfid();
+    if (TOUCH_PIN >= 0 && digitalRead(TOUCH_PIN) != TOUCH_ACTIVE) { delay(30); continue; }
+    if (sensor.genImg() != 0x00) { delay(60); continue; }
+    raw = sensor.upImage(imageBuffer, IMAGE_BYTES);
+    if (raw <= 0) break;
+    tz = sensor.img2Tz(1);
+    if (tz == 0x00) break;
+    snprintf(msg, sizeof(msg), "PAIR:REJECT tz=%d", tz);
+    replyToTester(msg);
+    delay(200);
+  }
+
+  if (raw <= 0 || tz != 0x00) {
+    if (raw < 0) snprintf(msg, sizeof(msg), "PAIR:FAIL step=raw code=%ld", raw);
+    else         snprintf(msg, sizeof(msg), "PAIR:TIMEOUT tz=%d", tz);
+    replyToTester(msg);
+    sensor.led(LED_CTRL_FLASH, LED_RED, 40, 3);
+    delay(600);
+    sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+    return;
+  }
+
+  sendBlob('R', imageBuffer, (uint32_t)raw);
+
+  long proc = sensor.upImage(imageBuffer, IMAGE_BYTES);
+  if (proc > 0) sendBlob('P', imageBuffer, (uint32_t)proc);
+
+  long chr = sensor.upChar(1, charBuffer, CHAR_BYTES_MAX);
+  if (chr > 0) sendBlob('C', charBuffer, (uint32_t)chr);
+
+  snprintf(msg, sizeof(msg), "PAIR:%s raw=%ld proc=%ld char=%ld",
+           (proc > 0 && chr > 0) ? "DONE" : "FAIL", raw, proc, chr);
+  replyToTester(msg);
+  sensor.led(LED_CTRL_FLASH, LED_BLUE, 60, 2);
+
+  // one press = one PAIR, and the normal path must not pick this press up
+  waitForLift();
+  sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+}
+
+void waitForLift() {
+  if (TOUCH_PIN < 0) { delay(1500); return; }
+  uint32_t lift = millis();
+  while (digitalRead(TOUCH_PIN) == TOUCH_ACTIVE && millis() - lift < 5000) { handleRfid(); delay(20); }
+  delay(300);
+}
+
+// ============================================================================
+// PROBE - does this module export templates at all? (capture_template_pairs.py --probe)
+// ============================================================================
+//
+// PAIR showed UpChar(1) after a single Img2Tz returns 2048 zero bytes. This
+// separates "single feature files are not exported, merged templates are"
+// from "template export is disabled":
+//   'I'  ReadProdInfo (0x3C)  - 46 bytes: model, sensor, image size, template size
+//   'S'  ReadSysPara  (0x0F)  - 16 bytes
+//   'F'  ReadInfPage  (0x16)  - 512 bytes, if supported
+//   'a'  UpChar(1) after press 1 -> Img2Tz(1)
+//   'b'  UpChar(2) after press 2 -> Img2Tz(2)
+//        Match(1,2)            - proves the buffers hold real features
+//   'T'  UpChar(1) after RegModel
+//   'U'  UpChar(2) after RegModel
+// Read-only: nothing is stored to the sensor's library.
+
+// Wait for a press the sensor's extractor accepts, features into `slot`.
+int pressInto(uint8_t slot, uint32_t timeoutMs, const char* who) {
+  uint32_t start = millis();
+  int tz = -1;
+  char msg[48];
+  while (millis() - start < timeoutMs) {
+    handleRfid();
+    if (TOUCH_PIN >= 0 && digitalRead(TOUCH_PIN) != TOUCH_ACTIVE) { delay(30); continue; }
+    if (sensor.genImg() != 0x00) { delay(60); continue; }
+    tz = sensor.img2Tz(slot);
+    if (tz == 0x00) return 0;
+    snprintf(msg, sizeof(msg), "%s:REJECT tz=%d", who, tz);
+    replyToTester(msg);
+    delay(200);
+  }
+  return tz;
+}
+
+void runProbe() {
+  char msg[160];
+  uint8_t out[48];
+
+  uint8_t p1[1] = { 0x3C };
+  int code = sensor.command(p1, 1, out, 46, 1500);
+  if (code == 0x00) sendBlob('I', out, 46);
+  snprintf(msg, sizeof(msg), "PROBE:INFO code=%d", code);
+  replyToTester(msg);
+
+  uint8_t p2[1] = { 0x0F };
+  if (sensor.command(p2, 1, out, 16, 1500) == 0x00) sendBlob('S', out, 16);
+
+  long inf = sensor.readInfPage(charBuffer, CHAR_BYTES_MAX);
+  if (inf > 0) sendBlob('F', charBuffer, (uint32_t)inf);
+
+  sensor.led(LED_CTRL_BREATH, LED_PURPLE, 100, 0);
+  replyToTester("PROBE:PLACE");
+  int tz1 = pressInto(1, 20000, "PROBE");
+  if (tz1 != 0) {
+    snprintf(msg, sizeof(msg), "PROBE:TIMEOUT press=1 tz=%d", tz1);
+    replyToTester(msg);
+    sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+    return;
+  }
+  long a = sensor.upChar(1, charBuffer, CHAR_BYTES_MAX);
+  if (a > 0) sendBlob('a', charBuffer, (uint32_t)a);
+  sensor.led(LED_CTRL_FLASH, LED_BLUE, 60, 2);
+  replyToTester("PROBE:LIFT");
+  waitForLift();
+
+  sensor.led(LED_CTRL_BREATH, LED_PURPLE, 100, 0);
+  replyToTester("PROBE:PLACE_AGAIN");
+  int tz2 = pressInto(2, 20000, "PROBE");
+  if (tz2 != 0) {
+    snprintf(msg, sizeof(msg), "PROBE:TIMEOUT press=2 tz=%d", tz2);
+    replyToTester(msg);
+    sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+    return;
+  }
+  long b = sensor.upChar(2, charBuffer, CHAR_BYTES_MAX);
+  if (b > 0) sendBlob('b', charBuffer, (uint32_t)b);
+
+  uint16_t score = 0;
+  int match = sensor.matchBuffers(&score);
+  int reg = sensor.regModel();
+  long t = -1, u = -1;
+  if (reg == 0x00) {
+    t = sensor.upChar(1, charBuffer, CHAR_BYTES_MAX);
+    if (t > 0) sendBlob('T', charBuffer, (uint32_t)t);
+    u = sensor.upChar(2, charBuffer, CHAR_BYTES_MAX);
+    if (u > 0) sendBlob('U', charBuffer, (uint32_t)u);
+  }
+
+  snprintf(msg, sizeof(msg),
+           "PROBE:DONE match=%d score=%u reg=%d a=%ld b=%ld T=%ld U=%ld inf=%ld",
+           match, score, reg, a, b, t, u, inf);
+  replyToTester(msg);
+  sensor.led(LED_CTRL_FLASH, LED_BLUE, 60, 2);
+  waitForLift();
+  sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+}
+
+// ============================================================================
+// Template lab - the PC drives the sensor's extractor and matcher
+// (test/r503_template_lab.py). No finger needed, library untouched.
+// ============================================================================
+//
+// IMG2TMPL  uploaded image -> DownImage -> Img2Tz(1) -> UpImage 'P' ->
+//           DownImage -> Img2Tz(2) -> RegModel -> UpChar(1) 'T'.
+//           A template from ONE image: recorded presses, and edited copies of
+//           them (shifted, rotated), become templates - which is how the
+//           format gets decoded. Img2Tz alone exports zeros on this firmware,
+//           hence the RegModel of the image with itself.
+// MATCHTMPL uploaded template B -> DownChar(2) -> Match against the template
+//           the last RegModel made (IMG2TMPL, or a live TMPL press). Measured:
+//           Match ignores a template sent with DownChar(1) and keeps comparing
+//           the RegModel output, so that is the side the PC cannot replace.
+//           This is 1:1 verification of a live press against a template the
+//           PC stores, by the sensor's own matcher.
+
+void runImg2Tmpl() {
+  char msg[160];
+  if (upTotal[0] == 0 || upGot[0] != upTotal[0]) {
+    replyToTester("IMG2TMPL:FAIL no image uploaded");
+    return;
+  }
+  static uint8_t* skel = NULL;                     // keeps imageBuffer intact for the 2nd DownImage
+  if (skel == NULL) skel = (uint8_t*)ps_malloc(IMAGE_BYTES);
+  if (skel == NULL) skel = (uint8_t*)malloc(IMAGE_BYTES);
+
+  uint32_t len = upTotal[0];
+  int d1 = sensor.downImage(imageBuffer, len);
+  int tz1 = (d1 == 0) ? sensor.img2Tz(1) : -1;
+  long proc = -1;
+  if (tz1 == 0 && skel != NULL && img2TmplSkeleton) {
+    proc = sensor.upImage(skel, IMAGE_BYTES);
+    if (proc > 0) sendBlob('P', skel, (uint32_t)proc);
+  }
+  int d2 = (tz1 == 0) ? sensor.downImage(imageBuffer, len) : -1;
+  int tz2 = (d2 == 0) ? sensor.img2Tz(2) : -1;
+  int reg = (tz2 == 0) ? sensor.regModel() : -1;
+  long t = -1;
+  if (reg == 0) {
+    t = sensor.upChar(1, charBuffer, CHAR_BYTES_MAX);
+    if (t > 0) sendBlob('T', charBuffer, (uint32_t)t);
+  }
+  snprintf(msg, sizeof(msg), "IMG2TMPL:%s down=%d tz1=%d proc=%ld down2=%d tz2=%d reg=%d tmpl=%ld",
+           t > 0 ? "DONE" : "FAIL", d1, tz1, proc, d2, tz2, reg, t);
+  replyToTester(msg);
+}
+
+// TMPL      live press -> template the PC decodes and matches (r503_template.py).
+//           A template only exists after RegModel, which needs two feature
+//           files, and Img2Tz cannot run twice on one capture: the first run
+//           marks the image buffer used (measured: a second Img2Tz answers 0x07
+//           in 3 ms). So the second feature file comes from a second capture
+//           of the same press, taken while the finger is still down - no image
+//           crosses the UART. If the finger was already lifted, it asks for the
+//           same finger again (TMPL:PLACE_AGAIN).
+// TMPL RAW  one capture only: it is uploaded before Img2Tz(1) and sent back
+//           with DownImage for Img2Tz(2) - exactly how the evaluated templates
+//           were built, at the cost of ~2.2 s of UART transfer. The image is
+//           also sent to the PC ('R'), for comparing matchers on one press.
+void runLiveTemplate(bool rawMode) {
+  char msg[112];
+  sensor.led(LED_CTRL_BREATH, LED_PURPLE, 100, 0);
+
+  // first capture -> CharBuffer1 (RAW mode keeps a copy of the image first)
+  uint32_t start = millis();
+  int tz1 = -1;
+  long raw = 0;
+  while (millis() - start < 15000) {
+    handleRfid();
+    if (TOUCH_PIN >= 0 && digitalRead(TOUCH_PIN) != TOUCH_ACTIVE) { delay(30); continue; }
+    if (sensor.genImg() != 0x00) { delay(60); continue; }
+    if (rawMode) {
+      raw = sensor.upImage(imageBuffer, IMAGE_BYTES);
+      if (raw <= 0) { tz1 = -2; break; }
+    }
+    tz1 = sensor.img2Tz(1);
+    if (tz1 == 0x00) break;
+    snprintf(msg, sizeof(msg), "TMPL:REJECT tz=%d", tz1);
+    replyToTester(msg);
+    delay(200);
+  }
+  if (tz1 != 0x00) {
+    snprintf(msg, sizeof(msg), "TMPL:TIMEOUT tz=%d", tz1);
+    replyToTester(msg);
+    sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+    return;
+  }
+
+  // second feature file -> CharBuffer2
+  uint32_t t1 = millis();
+  int tz2 = -1, captures = 1;
+  if (rawMode) {
+    int d = sensor.downImage(imageBuffer, (uint32_t)raw);
+    tz2 = (d == 0) ? sensor.img2Tz(2) : -1;
+  } else {
+    bool asked = false;
+    while (millis() - t1 < 10000) {
+      handleRfid();
+      bool touching = (TOUCH_PIN < 0) || digitalRead(TOUCH_PIN) == TOUCH_ACTIVE;
+      if (touching && sensor.genImg() == 0x00) {
+        captures++;
+        tz2 = sensor.img2Tz(2);
+        if (tz2 == 0x00) break;
+      } else if (!asked && millis() - t1 > 600) {  // finger already gone
+        replyToTester("TMPL:PLACE_AGAIN");
+        sensor.led(LED_CTRL_FLASH, LED_PURPLE, 60, 0);
+        asked = true;
+      }
+      delay(40);
+    }
+  }
+
+  int reg = (tz2 == 0x00) ? sensor.regModel() : -1;
+  long t = -1;
+  if (reg == 0x00) {
+    t = sensor.upChar(1, charBuffer, CHAR_BYTES_MAX);
+    if (t > 0) sendBlob('T', charBuffer, (uint32_t)t);
+    // RAW: the PC also gets the image the template was built from, so image
+    // matchers can be compared with the template on identical presses
+    if (t > 0 && rawMode) sendBlob('R', imageBuffer, (uint32_t)raw);
+  }
+  snprintf(msg, sizeof(msg), "TMPL:%s mode=%s tz2=%d reg=%d tmpl=%ld captures=%d ms=%lu",
+           t > 0 ? "DONE" : "FAIL", rawMode ? "raw" : "fast", tz2, reg, t, captures,
+           (unsigned long)(millis() - start));
+  replyToTester(msg);
+  sensor.led(LED_CTRL_FLASH, t > 0 ? LED_BLUE : LED_RED, 60, 2);
+  waitForLift();
+  sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
+}
+
+// CONFIRM <stamp>  the sensor double-check (fingerprint_gym.py, r503_link.py).
+//           The PC found the last press it received a borderline match and asks
+//           the R503's own matcher. The press is still in lastSentFrame: it goes
+//           back to the sensor (DownImage), its template is built (Img2Tz x2 on
+//           two downloads, RegModel), and is left as the side Match compares
+//           against; the PC then sends the member's stored templates with
+//           MATCHTMPL. <stamp> must name the frame still held here, or another
+//           press could be checked by mistake.
+uint8_t confirmPacked[IMAGE_BYTES / 2];
+
+void runConfirm(uint32_t stamp) {
+  char msg[96];
+  if (lastSentFrame == NULL || lastSentBytes == 0 || stamp != lastSentStamp) {
+    snprintf(msg, sizeof(msg), "CONFIRM:FAIL stale have=%lu", (unsigned long)lastSentStamp);
+    replyToTester(msg);
+    return;
+  }
+  // back in the format the sensor delivered it (8-bit values are nibble n * 17)
+  const uint8_t* src = lastSentFrame;
+  uint32_t len = lastSentBytes;
+  if (lastSentPacked) {
+    for (uint32_t i = 0; i < lastSentBytes / 2; i++)
+      confirmPacked[i] = (lastSentFrame[2 * i] & 0xF0) | (lastSentFrame[2 * i + 1] >> 4);
+    src = confirmPacked;
+    len = lastSentBytes / 2;
+  }
+  uint32_t t0 = millis();
+  int d1 = sensor.downImage(src, len);
+  int tz1 = (d1 == 0) ? sensor.img2Tz(1) : -1;
+  int d2 = (tz1 == 0) ? sensor.downImage(src, len) : -1;
+  int tz2 = (d2 == 0) ? sensor.img2Tz(2) : -1;
+  int reg = (tz2 == 0) ? sensor.regModel() : -1;
+  snprintf(msg, sizeof(msg), "CONFIRM:%s down=%d tz1=%d down2=%d tz2=%d reg=%d ms=%lu",
+           reg == 0 ? "DONE" : "FAIL", d1, tz1, d2, tz2, reg, (unsigned long)(millis() - t0));
+  replyToTester(msg);
+}
+
+void runMatchTmpl() {
+  char msg[96];
+  if (upTotal[2] == 0 || upGot[2] != upTotal[2]) {
+    replyToTester("MATCHTMPL:FAIL template B not uploaded");
+    return;
+  }
+  int dB = sensor.downChar(2, tmplB, upTotal[2]);
+  uint16_t score = 0;
+  int m = (dB == 0) ? sensor.matchBuffers(&score) : -1;
+  snprintf(msg, sizeof(msg), "MATCHTMPL:%s downB=%d match=%d score=%u",
+           (dB == 0 && m >= 0) ? "DONE" : "FAIL", dB, m, score);
+  replyToTester(msg);
 }
 
 // ============================================================================
@@ -714,13 +1214,47 @@ void replyToTester(const char* msg) {
   Serial.printf("-> %s\n", msg);
 }
 
+// Packet: "FPUP" + slot(1) + total(u32 LE) + offset(u32 LE) + payload. The PC
+// sends chunks in order and waits for each "UP:<slot> <got>/<total>" ack.
+void handleUpload(const uint8_t* pkt, int n) {
+  char slot = (char)pkt[4];
+  uint32_t total, off, len = (uint32_t)(n - 13);
+  memcpy(&total, pkt + 5, 4);
+  memcpy(&off, pkt + 9, 4);
+  int i = (slot == 'I') ? 0 : (slot == 'B') ? 2 : -1;
+  uint32_t cap = (i == 0) ? IMAGE_BYTES : CHAR_BYTES_MAX;
+  char msg[48];
+  if (i < 0 || total > cap || off + len > total) {
+    snprintf(msg, sizeof(msg), "UP:%c ERR", slot);
+    replyToTester(msg);
+    return;
+  }
+  uint8_t* dst = (i == 0) ? imageBuffer : tmplB;
+  memcpy(dst + off, pkt + 13, len);
+  upTotal[i] = total;
+  upGot[i] = off + len;
+  snprintf(msg, sizeof(msg), "UP:%c %lu/%lu", slot, (unsigned long)upGot[i], (unsigned long)total);
+  replyToTester(msg);
+}
+
 void handleUdpCommands() {
   int size = udp.parsePacket();
   if (size <= 0) return;
 
-  char buf[161];
-  int n = udp.read(buf, sizeof(buf) - 1);
+  static uint8_t pkt[1472];
+  int n = udp.read(pkt, sizeof(pkt));
   if (n <= 0) return;
+
+  if (n >= 13 && memcmp(pkt, "FPUP", 4) == 0) {   // template lab upload
+    lastCmdIP = udp.remoteIP();
+    lastCmdPort = udp.remotePort();
+    handleUpload(pkt, n);
+    return;
+  }
+
+  char buf[161];
+  n = min(n, (int)sizeof(buf) - 1);
+  memcpy(buf, pkt, n);
   buf[n] = 0;
 
   // ---- RFID verdict from rfid_gym.py (kept apart from the tester's reply address) ----
@@ -766,6 +1300,39 @@ void handleUdpCommands() {
     else if (strncasecmp(c, "BREATH", 6) == 0) ok = sensor.led(LED_CTRL_BREATH, LED_BLUE, 100, 0);
     else if (strncasecmp(c, "OFF", 3) == 0)    ok = sensor.led(LED_CTRL_OFF, LED_BLUE);
     replyToTester(ok ? "LED:OK" : "LED:FAIL");
+    return;
+  }
+  if (strncasecmp(buf, "PAIR", 4) == 0) {          // image + feature file, one press
+    pairRequested = true;
+    replyToTester("PAIR:WAIT");
+    return;
+  }
+  if (strncasecmp(buf, "PROBE", 5) == 0) {         // template export check, two presses
+    probeRequested = true;
+    replyToTester("PROBE:WAIT");
+    return;
+  }
+  if (strncasecmp(buf, "IMG2TMPL", 8) == 0) {      // template from the uploaded image
+    img2TmplRequested = true;
+    img2TmplSkeleton = (strstr(buf, "FAST") == NULL);
+    replyToTester("IMG2TMPL:WAIT");
+    return;
+  }
+  if (strncasecmp(buf, "CONFIRM", 7) == 0) {       // "CONFIRM <stamp>": double-check that press
+    confirmStamp = (uint32_t)strtoul(buf + 7, NULL, 10);
+    confirmRequested = true;
+    replyToTester("CONFIRM:WAIT");
+    return;
+  }
+  if (strncasecmp(buf, "MATCHTMPL", 9) == 0) {     // sensor Match of an uploaded template
+    matchTmplRequested = true;
+    replyToTester("MATCHTMPL:WAIT");
+    return;
+  }
+  if (strncasecmp(buf, "TMPL", 4) == 0) {          // template from a live press ("TMPL RAW")
+    liveTmplRequested = true;
+    liveTmplRaw = (strncasecmp(buf + 4, " RAW", 4) == 0);
+    replyToTester("TMPL:WAIT");
     return;
   }
   if (strncasecmp(buf, "CAPTURE", 7) == 0) {       // test-driven capture window

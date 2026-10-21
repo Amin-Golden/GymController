@@ -10,3 +10,5 @@ fingerprint_storage/images/enrolled/
 fingerprint_storage/images/queries/
 fingerprint_storage/nbis_gallery/
 test/r503_captures/
+test/template_pairs/
+test/template_lab/
